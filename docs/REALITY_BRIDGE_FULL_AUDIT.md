@@ -37,6 +37,19 @@ navigator.userAgent.includes("FloatShell/")
 
 截图中“iOS现实桥”这一字面标题在 Doremy 公开 `main` 与开发仓库 `main` 中都不存在。说明截图对应的不是当前公开源码构建，可能是老师尚未公开的新版或其他自定义版本，不能据此判断本仓库缺文件。
 
+## Netlify 线上部署指纹（最终定位）
+
+对正式生产地址 `https://statuesque-lokum-5f1aec.netlify.app` 的实际 JS 构建检查结果：
+
+- 线上存在字面标题 `iOS现实桥`；
+- 线上不存在 `本机安卓桥`、`角色能看见什么`、`角色能做什么`；
+- `iOS现实桥` 与 `jianchu-in/momo.float.phone` 的 `components/reality-bridge-app.tsx` 完全对应；
+- `xbabjak-wrb/momo.float.phone` 与 Doremy 基线的实际源码使用 `现实桥` 标题，并包含 Android 本机桥分支。
+
+因此可以确定：**Netlify 当前连接/发布的生产源码不是 `xbabjak-wrb/momo.float.phone` 的当前 `main`**。APK 本身带有正确 Android 原生桥，但它加载的网页仍然是 momo 旧版本，所以界面只显示 iOS 现实桥。
+
+解决方式是保持原 Netlify 域名不变，在 Netlify 的 `Site configuration → Build & deploy → Continuous deployment → Repository` 中重新连接 `xbabjak-wrb/momo.float.phone` 的 `main` 分支，然后重新部署。不要删除 iOS 现实桥，也不要在没有备份时清除站点数据。
+
 ## 与 Doremy 公开 main 的差异
 
 你的仓库完整包含 Doremy 的 1219 个文件。除以下文档/构建辅助改动外，其余文件内容完全一致：
