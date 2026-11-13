@@ -51,6 +51,7 @@ navigator.userAgent.includes("FloatShell/")
 - `.github/workflows/android-reality-bridge-validation.yml`
 - `scripts/check-android-reality-bridge.mjs`
 - `docs/ANDROID_REALITY_BRIDGE_DEPLOYMENT.md`
+- `docs/REALITY_BRIDGE_FULL_AUDIT.md`
 
 ## 与 Doremy 开发仓库 main 的差异
 
