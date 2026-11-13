@@ -159,14 +159,14 @@ function ModuleChipSelector({
     <div className="data-module-chip-grid" role="group" aria-label={ariaLabel}>
       {items.map((item) => {
         const selected = selectedIds.includes(item.id);
-        const Icon = MODULE_ICONS[item.id];
+        const Icon = MODULE_ICONS[item.id] ?? Archive;
         return (
           <button
             key={item.id}
             type="button"
             className="data-module-chip"
             aria-pressed={selected}
-            style={iconStyle(MODULE_ACCENTS[item.id])}
+            style={iconStyle(MODULE_ACCENTS[item.id] ?? BINDING_ACCENTS.regex)}
             {...(selected ? { "data-selected": "" } : {})}
             onClick={() => {
               if (selected) onChange(selectedIds.filter((id) => id !== item.id));
@@ -209,7 +209,7 @@ function ModulePieChart({ modules, totalBytes }: { modules: ModuleStats[]; total
                 cx="60"
                 cy="60"
                 r={radius}
-                stroke={MODULE_ACCENTS[module.moduleId]}
+                stroke={MODULE_ACCENTS[module.moduleId] ?? BINDING_ACCENTS.regex}
                 strokeDasharray={`${dash} ${circumference - dash}`}
                 strokeDashoffset={-offset}
               />
@@ -226,7 +226,7 @@ function ModulePieChart({ modules, totalBytes }: { modules: ModuleStats[]; total
       <div className="data-pie-legend">
         {modules.map((module) => (
           <div key={module.moduleId} className="data-pie-legend-item">
-            <span className="data-pie-dot" style={{ background: MODULE_ACCENTS[module.moduleId] }} />
+            <span className="data-pie-dot" style={{ background: MODULE_ACCENTS[module.moduleId] ?? BINDING_ACCENTS.regex }} />
             <span className="data-pie-name">{module.label}</span>
             <span className="data-pie-value">{module.percent}% · {formatBytes(module.bytes)}</span>
             {module.details && module.details.length > 0 && (
@@ -412,11 +412,13 @@ export function DataManagement({ onNotice }: DataManagementProps) {
     [],
   );
   const pendingImportItems = useMemo<ModuleChipItem[]>(
-    () => pendingImport?.manifest.modules.map((module) => ({
-      id: module.id,
-      label: module.label,
-      meta: `${module.records} 项 · ${formatBytes(module.bytes)}`,
-    })) ?? [],
+    () => pendingImport?.manifest.modules
+      .filter((module) => ALL_MODULE_IDS.includes(module.id))
+      .map((module) => ({
+        id: module.id,
+        label: module.label,
+        meta: `${module.records} 项 · ${formatBytes(module.bytes)}`,
+      })) ?? [],
     [pendingImport],
   );
   const reloadStats = async () => {
@@ -501,9 +503,17 @@ export function DataManagement({ onNotice }: DataManagementProps) {
     if (!file) return;
     await runAction("读取备份", async () => {
       const manifest = await readBackupManifest(file);
+      const supportedModules = manifest.modules.filter((module) => ALL_MODULE_IDS.includes(module.id));
+      const unsupportedModules = manifest.modules.filter((module) => !ALL_MODULE_IDS.includes(module.id));
+      if (supportedModules.length === 0) {
+        throw new Error(`这份备份只包含当前版本已移除的旧模块：${unsupportedModules.map((module) => module.id).join("、")}，没有可导入的数据。`);
+      }
       setPendingImport({ file, manifest });
-      setSelectedImportModules(manifest.modules.map((module) => module.id));
-      return `已读取备份：${manifest.modules.map((module) => module.label).join("、")}`;
+      setSelectedImportModules(supportedModules.map((module) => module.id));
+      const skippedNote = unsupportedModules.length > 0
+        ? `；已跳过当前版本不支持的旧模块：${unsupportedModules.map((module) => module.id).join("、")}`
+        : "";
+      return `已读取备份：${supportedModules.map((module) => module.label).join("、")}${skippedNote}`;
     });
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
