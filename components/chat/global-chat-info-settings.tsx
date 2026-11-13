@@ -37,7 +37,6 @@ import {
 import { CHAT_SESSION_CSS_EXAMPLE } from "@/lib/css-examples";
 import { fileToUserAvatarDataUrl } from "@/lib/user-avatar-image";
 import { CustomStatusFrame } from "./custom-status-frame";
-import { clearChatOfflineTurns, loadChatOfflineTurns } from "@/lib/chat-offline-storage";
 
 function saveSettings(patch: Record<string, unknown>) {
     saveChatAppSettings({ ...loadChatAppSettings(), ...patch });
@@ -134,7 +133,6 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
     const [visionLimit, setVisionLimit] = useState(() => normalizeVisionImagePromptLimit(initial.globalVisionImagePromptLimit));
     const [status, setStatus] = useState<StatusRegionConfig>(() => getStatusRegionConfig(GLOBAL_CHAT_STATUS_REGION_ID, false));
     const [meetingInvite, setMeetingInvite] = useState<MeetingInviteCardConfig>(() => resolveMeetingInviteCardConfig(initial));
-    const [storyAsOfflineMode, setStoryAsOfflineMode] = useState(initial.storyAsOfflineMode === true);
     const [editingCSS, setEditingCSS] = useState(false);
     const [editingStatus, setEditingStatus] = useState(false);
     const [editingMeetingInvite, setEditingMeetingInvite] = useState(false);
@@ -182,21 +180,6 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
         saveSettings({ globalVisionImagePromptLimit: next });
     };
 
-    const changeStoryAsOfflineMode = (value: boolean) => {
-        if (!value) {
-            const sessionsWithOffline = loadChatSessions().filter(session => loadChatOfflineTurns(session.id).length > 0);
-            if (sessionsWithOffline.length) {
-                const keep = window.confirm(`检测到 ${sessionsWithOffline.length} 个会话仍有旧线下消息。\n\n确定：保留旧消息并恢复旧线下模式\n取消：继续选择是否清空旧消息`);
-                if (!keep) {
-                    const clear = window.confirm("要清空这些旧线下消息吗？摘要也会随旧记录一起删除。此操作不可恢复。\n\n确定：清空\n取消：保留");
-                    if (clear) sessionsWithOffline.forEach(session => clearChatOfflineTurns(session.id));
-                }
-            }
-        }
-        setStoryAsOfflineMode(value);
-        saveSettings({ storyAsOfflineMode: value });
-    };
-
     // 全部角色恢复默认：清空每个会话的单独聊天室 CSS，全部回落到全局聊天室 CSS / 主页外观 CSS。
     // 逐个派发 chat-session-css-updated，让正打开的聊天室（含桌面小窗）立即生效。
     const resetAllSessionCSS = () => {
@@ -235,6 +218,8 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
     const meetingInvitePayload = JSON.stringify({
         type: "ai-phone-meeting-invite-card",
         version: 1,
+        enabled: draftMeetingInvite.enabled === true,
+        remarkEnabled: draftMeetingInvite.remarkEnabled === true,
         contract: draftMeetingInvite.contract,
         renderHtml: draftMeetingInvite.renderHtml,
         previewRaw: draftMeetingInvite.previewRaw,
@@ -245,6 +230,8 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
             const parsed = JSON.parse(payload) as Record<string, unknown>;
             const next: MeetingInviteCardConfig = {
                 mode: "custom",
+                enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : false,
+                remarkEnabled: typeof parsed.remarkEnabled === "boolean" ? parsed.remarkEnabled : false,
                 contract: typeof parsed.contract === "string" ? parsed.contract : DEFAULT_MEETING_INVITE_CONTRACT,
                 renderHtml: typeof parsed.renderHtml === "string" ? parsed.renderHtml : DEFAULT_MEETING_INVITE_RENDER,
                 previewRaw: typeof parsed.previewRaw === "string" ? parsed.previewRaw : DEFAULT_MEETING_INVITE_PREVIEW,
@@ -252,6 +239,32 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
             setDraftMeetingInvite(next);
             setMeetingPreviewHtml(next.renderHtml);
         } catch { alert("导入失败：不是有效的邀请见面卡片方案"); }
+    };
+
+    // 开关类改动用「即时保存」：改一下就落盘，不再躺在草稿里等人点「应用」。
+    // 只落 patch 里的字段（开关），文本框内容仍归「应用」管，避免顺带把未确认的草稿一起写进配置。
+    const persistMeetingInvite = (patch: Partial<MeetingInviteCardConfig>) => {
+        const saved = { ...meetingInvite, ...patch };
+        setMeetingInvite(saved);
+        setDraftMeetingInvite(current => ({ ...current, ...patch }));
+        saveSettings({ meetingInviteCard: saved });
+    };
+
+    // 契约/渲染/预览这些文本改动仍是草稿，返回时若没点「应用」必须提醒，不能无声丢弃。
+    const isMeetingDraftDirty = (() => {
+        const a = draftMeetingInvite;
+        const b = meetingInvite;
+        return a.mode !== b.mode
+            || (a.enabled === true) !== (b.enabled === true)
+            || (a.remarkEnabled === true) !== (b.remarkEnabled === true)
+            || a.contract !== b.contract
+            || a.renderHtml !== b.renderHtml
+            || a.previewRaw !== b.previewRaw;
+    })();
+
+    const closeMeetingInviteEditor = () => {
+        if (isMeetingDraftDirty && !window.confirm("有未保存的修改（上面的开关已即时生效，文本框内容尚未应用），确定放弃吗？")) return;
+        setEditingMeetingInvite(false);
     };
 
     if (editingCSS) {
@@ -273,14 +286,23 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
 
     if (editingMeetingInvite) {
         return (
-            <PageShell title="邀请见面卡片 CSS 样式" onBack={() => setEditingMeetingInvite(false)} className="absolute inset-0 z-[110]">
+            <PageShell title="邀请见面卡片 CSS 样式" onBack={closeMeetingInviteEditor} className="absolute inset-0 z-[110]">
                 <div className="theme-section-page flex flex-col gap-3">
                     <div className="menu-group">
+                        <div className="menu-item">
+                            <div className="menu-label-group"><span className="menu-label">注入邀请卡片提示词</span><span className="menu-desc">开启后每轮注入；仅私聊 + 线上模式生效，群聊与线下模式不注入</span></div>
+                            <Toggle checked={draftMeetingInvite.enabled === true} onChange={checked => persistMeetingInvite({ enabled: checked })} />
+                        </div>
+                        <div className="menu-item">
+                            <div className="menu-label-group"><span className="menu-label">注入私聊备注提示词</span><span className="menu-desc">开启后每轮注入；仅私聊 + 线上模式生效，群聊与线下模式不注入</span></div>
+                            <Toggle checked={draftMeetingInvite.remarkEnabled === true} onChange={checked => persistMeetingInvite({ remarkEnabled: checked })} />
+                        </div>
                         <div className="menu-item">
                             <div className="menu-label-group"><span className="menu-label">启用自定义卡片</span><span className="menu-desc">关闭时使用 Float 默认邀请卡片</span></div>
                             <Toggle checked={draftMeetingInvite.mode === "custom"} onChange={checked => setDraftMeetingInvite(current => ({ ...current, mode: checked ? "custom" : "native" }))} />
                         </div>
                     </div>
+                    <p className="ts-12 leading-relaxed text-[var(--c-text)] opacity-65 px-1">三个开关改动即时生效并自动保存；下面的文本框是草稿，改完要点「应用」才保存，直接返回会提示你是否放弃。</p>
                     {draftMeetingInvite.mode === "custom" ? <>
                         <label className="ts-13 font-medium text-[var(--c-text-title)]">输出契约</label>
                         <textarea className="ui-textarea font-mono ts-12" style={{ minHeight: 130, resize: "vertical" }} value={draftMeetingInvite.contract} onChange={event => setDraftMeetingInvite(current => ({ ...current, contract: event.target.value }))} placeholder="告诉 AI 何时发起邀请，并列出卡片要填写的 key=value 字段" />
@@ -300,7 +322,7 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
                     <div className="flex gap-2 items-center">
                         <CSSSchemeBar target="meeting_invite_card" currentCSS={meetingInvitePayload} onLoad={loadMeetingInvitePayload} />
                         <button className="ui-btn ui-btn-outline flex-1" onClick={() => {
-                            const next = { mode: "native", contract: DEFAULT_MEETING_INVITE_CONTRACT, renderHtml: DEFAULT_MEETING_INVITE_RENDER, previewRaw: DEFAULT_MEETING_INVITE_PREVIEW } as MeetingInviteCardConfig;
+                            const next = { mode: "native", enabled: draftMeetingInvite.enabled === true, remarkEnabled: draftMeetingInvite.remarkEnabled === true, contract: DEFAULT_MEETING_INVITE_CONTRACT, renderHtml: DEFAULT_MEETING_INVITE_RENDER, previewRaw: DEFAULT_MEETING_INVITE_PREVIEW } as MeetingInviteCardConfig;
                             setDraftMeetingInvite(next);
                             setMeetingPreviewHtml(next.renderHtml);
                         }}>恢复默认</button>
@@ -346,11 +368,6 @@ export function GlobalChatInfoSettings({ onBack }: { onBack: () => void }) {
             <div className="page-menu chat-info-menu">
                 <div className="px-4 pb-2 ts-12 text-[var(--c-text)] opacity-65">单独会话设置优先于这里；这里只改变聊天室，不会修改主页用户资料。状态栏仍仅用于私聊。</div>
                 <div className="menu-group">
-                    <div className="menu-item">
-                        <Play size={20} className="text-[var(--c-icon)]" />
-                        <div className="menu-label-group"><span className="menu-label">剧情入口</span><span className="menu-desc">用剧情作为线下模式；旧线下记录进入时可选择迁移方式</span></div>
-                        <Toggle checked={storyAsOfflineMode} onChange={changeStoryAsOfflineMode} />
-                    </div>
                     <div className="menu-item cursor-pointer" role="button" tabIndex={0} onClick={() => avatarInputRef.current?.click()} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") avatarInputRef.current?.click(); }}>
                         <User size={20} className="text-[var(--c-icon)]" />
                         <div className="menu-label-group"><span className="menu-label">用户头像</span><span className="menu-desc">所有私聊和群聊默认使用</span></div>

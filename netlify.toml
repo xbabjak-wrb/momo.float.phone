@@ -10,7 +10,7 @@
   package = "@netlify/plugin-nextjs"
 
 # 离线推送的执行函数已迁移至 Supabase Edge Functions（supabase/functions/），
-# 原因：Netlify Background Functions 免费档不可用。部署方式见 docs/push-supabase.sql。
+# 原因：Netlify Background Functions 免费档不可用。新部署方式见 docs/personal-push-supabase.sql；docs/push-supabase.sql 仅供旧版站点共享推送迁移维护。
 
 # 字体/模型/图片是不带指纹的静态资源，体积大（中文字体 7~24MB、3D 模型 10MB+）。
 # 设为一年 immutable，浏览器命中后回访零带宽。更新这些文件时请改文件名（加版本后缀），
@@ -72,6 +72,15 @@
   for = "/xiaohongshu/*"
   [headers.values]
     Cache-Control = "public, max-age=31536000, immutable"
+
+# Service Worker 文件本身绝不能缓存：浏览器只在「拿到新的 sw.js」时才会触发
+# install/activate。若 sw.js 被 CDN 或浏览器缓存住，页面会一直跑旧 SW、
+# 拿不到新构建（本次通话折叠修复就卡在这里：/main@fa42d13 已含修复，
+# 客户端却仍在跑旧 JS）。
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
 
 # 根目录散图（吉祥物小卷、默认壁纸）——同样改文件名才更新。
 [[headers]]

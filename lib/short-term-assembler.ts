@@ -3,12 +3,11 @@
 // a unified timeline. Replaces the old ShortTermEvent IndexedDB approach.
 // Used by: memory-bank-page (UI display), memory-summarizer (summarization input).
 
-import { getSystemInstructionPromptContent, isReadingDiscussMessage, isSystemInstructionMessage, loadChatSessions, loadChatMessages, type ChatMessage } from "./chat-storage";
+import { getSystemInstructionPromptContent, isReadingDiscussMessage, isSystemInstructionMessage, loadChatSessions, loadChatMessages, resolveSessionCharacterId, type ChatMessage } from "./chat-storage";
 import { buildGroupAdminBracketText } from "./group-admin";
 import { loadMomentPosts, loadMomentComments } from "./moments-storage";
 import { loadCharacters } from "./character-storage";
 import { resolveUserIdentity } from "./settings-storage";
-import { resolveChatAccountUserIdentity } from "./chat-scope-storage";
 import { loadMemoryConfig } from "./memory-storage";
 import type { MemoryConfig } from "./memory-types";
 import { estimateTokens } from "./token-counter";
@@ -18,6 +17,9 @@ import { loadVnProjectionEntries } from "./vn-storage";
 import { loadMapProjectionEntries, loadMapSharedProjectionEntries } from "./map-storage";
 import { loadGameProjectionEntries } from "./game-storage";
 import { loadDiaryEntries } from "./diary-entry-storage";
+import { loadVirtualLifeState } from "./life/life-storage";
+import { loadPhotoWallState } from "./photo-wall-storage";
+import { asPlayerRecordSubject } from "./life/life-timeline-subject";
 import type { DiaryEntry, DiaryEntryBlock } from "./diary-entry-types";
 import { loadNoteWallProjectionEntries } from "./notewall-memory";
 import { loadXiaohongshuProjectionEntries } from "./xiaohongshu-memory";
@@ -43,10 +45,6 @@ import {
     resolvePromptTimeAware,
     type PromptTimestampOptions,
 } from "./prompt-time";
-import { getNativeTimelineEntryKey } from "./native-timeline-key";
-import { mergeShortMemoryEntries, applyShortMemoryToChatHistory, hiddenMemoryKeys, isMemoryEntryDeleted } from "./short-term-memory-records";
-export { getNativeTimelineEntryKey } from "./native-timeline-key";
-export { hideNativeTimelineEntries } from "./short-term-memory-records";
 
 function formatPhotoDirectiveForPrompt(msg: ChatMessage): string {
     const description = msg.mediaData?.label?.trim() || "图片";
@@ -56,22 +54,16 @@ function formatPhotoDirectiveForPrompt(msg: ChatMessage): string {
 
 export type NativeTimelineEntry = {
     id: string;
-    sourceApp: "chat" | "moments" | "story" | "vn" | "map" | "game" | "diary" | "xiaohongshu" | "interview_magazine" | "cocreate" | "checkphone" | "custom_app";
-    sourceDetail?: "direct" | "group" | "system" | "story" | "chat_offline" | "game" | "diary_entry" | "notewall" | "xiaohongshu" | "black_market_theater" | "interview_issue" | "interview_shared_issue" | "cocreate_project" | "checkphone" | "custom_app_event"; // chat sub-type: 1:1 vs group chat vs system note
+    sourceApp: "chat" | "moments" | "story" | "vn" | "map" | "game" | "diary" | "xiaohongshu" | "interview_magazine" | "cocreate" | "checkphone" | "custom_app" | "photo_wall" | "life" | "phone_widget" | "watch" | "global_watch";
+    sourceDetail?: "direct" | "group" | "system" | "story" | "chat_offline" | "game" | "diary_entry" | "notewall" | "xiaohongshu" | "black_market_theater" | "interview_issue" | "interview_shared_issue" | "cocreate_project" | "checkphone" | "custom_app_event" | "life_shared_event" | "photo_wall_creation"; // chat sub-type: 1:1 vs group chat vs system note
     authorType?: "user" | "character" | "npc"; // who authored this entry
     postAuthorType?: "user" | "character"; // for moments: who owns the parent post
     sessionId?: string;
-    chatAccountId?: string;
-    userNickname?: string;
     groupSessionId?: string; // for group chat: which group session
     groupName?: string;      // for group chat: display name of the group
     timestamp: string; // ISO date
     content: string;   // formatted content for display / summarization
     momentsMeta?: NativeMomentMeta;
-    memorySupplement?: boolean;
-    memoryRawContent?: string;
-    memoryScope?: "short" | "shared";
-    sourceLabel?: string;
     customAppId?: string;
     customAppName?: string;
     customAppLabel?: string;
@@ -169,24 +161,19 @@ function formatDiaryEntryForTimeline(entry: DiaryEntry, timeAware: boolean, time
  * @param characterId - The character to load data for
  * @param options.afterTimestamp - Only include entries after this ISO timestamp
  */
-function* assembleNativeTimeline(
+export function loadNativeTimeline(
     characterId: string,
     options?: {
         afterTimestamp?: string;
         userName?: string;
         appId?: import("./settings-types").ContentAppId;
         excludeOfflineSessionId?: string;
-        /** 限定聊天账号；undefined 表示跨账号读取，null 表示只读主号。 */
-        chatAccountId?: string | null;
-        excludeChatSessionId?: string;
-        includeDeleted?: boolean;
-        signal?: AbortSignal;
+        memoryTarget?: "short_term" | "long_term" | "core";
         timeAware?: boolean;
         promptTimestampOptions?: PromptTimestampOptions;
     }
-): Generator<void, NativeTimelineEntry[], void> {
+): NativeTimelineEntry[] {
     const entries: NativeTimelineEntry[] = [];
-    let processedMessages = 0;
     const chars = loadCharacters();
     const userName = options?.userName ?? resolveUserIdentity(characterId, options?.appId)?.name ?? "用户";
     const charName = chars.find(c => c.id === characterId)?.name ?? "角色";
@@ -195,26 +182,20 @@ function* assembleNativeTimeline(
 
     // ── Chat messages ──
     const sessions = loadChatSessions();
-    const matchesChatAccount = (session: { chatAccountId?: string }) => (
-        options?.chatAccountId === undefined
-        || (session.chatAccountId || null) === options.chatAccountId
-    );
     // Include direct chat session AND group sessions where this character participates
-    const directSessions = sessions.filter(s => !s.isGroup && s.contactId === characterId && matchesChatAccount(s) && s.id !== options?.excludeChatSessionId);
-    const groupSessions = sessions.filter(s => s.isGroup && s.participantIds?.includes(characterId) && matchesChatAccount(s));
+    const session = sessions.find(s => !s.isGroup && resolveSessionCharacterId(s) === characterId);
+    const groupSessions = sessions.filter(s => s.isGroup && s.participantIds?.includes(characterId));
 
     // Process group sessions
     for (const gs of groupSessions) {
-        const sessionUserName = resolveChatAccountUserIdentity(gs.chatAccountId, undefined, "group_chat")?.name || gs.userNickname || userName;
         const messages = loadChatMessages(gs.id);
         for (const msg of messages) {
-            if (++processedMessages % 100 === 0) yield;
             if (msg.isRetracted) continue;
             if (isPromptHiddenChatMessage(msg)) continue;
             if (options?.afterTimestamp && msg.createdAt <= options.afterTimestamp) continue;
 
             let sender: string;
-            if (msg.role === "user") sender = msg.senderName || sessionUserName;
+            if (msg.role === "user") sender = userName;
             else if (msg.role === "tool") sender = "工具";
             else if (isSystemInstructionMessage(msg)) sender = "系统指令";
             else if (msg.role === "system") continue; // skip system messages in group timeline
@@ -288,9 +269,6 @@ function* assembleNativeTimeline(
                 id: msg.id,
                 sourceApp: "chat",
                 sourceDetail: "group",
-                authorType: msg.role === "user" ? "user" : "character",
-                chatAccountId: gs.chatAccountId,
-                userNickname: sessionUserName,
                 groupSessionId: gs.id,
                 groupName: gs.groupName || "群聊",
                 timestamp: msg.createdAt,
@@ -299,11 +277,9 @@ function* assembleNativeTimeline(
         }
     }
 
-    for (const session of directSessions) {
-        const sessionUserName = resolveChatAccountUserIdentity(session.chatAccountId, characterId, "chat")?.name || session.userNickname || userName;
+    if (session) {
         const messages = loadChatMessages(session.id);
         for (const msg of messages) {
-            if (++processedMessages % 100 === 0) yield;
             if (msg.isRetracted) continue;
             if (isPromptHiddenChatMessage(msg)) continue;
             if (options?.afterTimestamp && msg.createdAt <= options.afterTimestamp) continue;
@@ -350,7 +326,7 @@ function* assembleNativeTimeline(
                 continue;
             }
 
-            const sender = msg.role === "user" ? (msg.senderName || sessionUserName) : msg.role === "tool" ? "工具" : `${charName}（对${sessionUserName}）`;
+            const sender = msg.role === "user" ? userName : msg.role === "tool" ? "工具" : charName;
             let content = stripStateAndInnerForPrompt(msg.content || "");
 
             // Action notifications: always override content to bracket format (stored content is natural language for UI)
@@ -414,10 +390,6 @@ function* assembleNativeTimeline(
                 id: msg.id,
                 sourceApp: "chat",
                 sourceDetail: "direct",
-                sessionId: session.id,
-                chatAccountId: session.chatAccountId,
-                userNickname: sessionUserName,
-                authorType: msg.role === "user" ? "user" : "character",
                 timestamp: msg.createdAt,
                 content: `${msgLabel} ${sender}: ${content}`,
             });
@@ -428,27 +400,11 @@ function* assembleNativeTimeline(
     // Each post + its comments become ONE timeline entry.
     const posts = loadMomentPosts();
     for (const post of posts) {
-        if (++processedMessages % 100 === 0) yield;
         if (!canCharacterSeeMomentPost(post, characterId)) continue;
         const isCharPost = post.authorId === characterId;
         const isUserPost = post.authorType === "user";
-        if (
-            isUserPost
-            && options?.chatAccountId !== undefined
-            && (post.chatAccountId || null) !== options.chatAccountId
-        ) continue;
-        const comments = getVisibleMomentCommentsForCharacter(post, characterId, loadMomentComments(post.id))
-            .filter(comment => (
-                comment.authorType !== "user"
-                || options?.chatAccountId === undefined
-                || (comment.chatAccountId || null) === options.chatAccountId
-            ));
-        const likes = getVisibleMomentLikesForCharacter(post, characterId, post.likes)
-            .filter(like => (
-                like.authorType !== "user"
-                || options?.chatAccountId === undefined
-                || (like.chatAccountId || null) === options.chatAccountId
-            ));
+        const comments = getVisibleMomentCommentsForCharacter(post, characterId, loadMomentComments(post.id));
+        const likes = getVisibleMomentLikesForCharacter(post, characterId, post.likes);
         const filteredComments = options?.afterTimestamp
             ? comments.filter(c => c.createdAt > options.afterTimestamp!)
             : comments;
@@ -463,7 +419,7 @@ function* assembleNativeTimeline(
         const postAuthor = post.authorType === "character"
             ? chars.find(ch => ch.id === post.authorId)
             : undefined;
-        const authorName = isUserPost ? (resolveChatAccountUserIdentity(post.chatAccountId, characterId, "chat")?.name || userName) : (post.authorId === characterId ? charName : (postAuthor?.name ?? "某人"));
+        const authorName = isUserPost ? userName : (post.authorId === characterId ? charName : (postAuthor?.name ?? "某人"));
         const postAuthorType = isUserPost ? "user" as const : "character" as const;
 
         // Skip entire post if both post and all comments are before afterTimestamp
@@ -484,7 +440,7 @@ function* assembleNativeTimeline(
         const structuredComments: NativeMomentComment[] = [];
 
         const resolveLikeName = (like: typeof filteredLikes[number]): string => {
-            if (like.authorType === "user") return resolveChatAccountUserIdentity(like.chatAccountId, characterId, "chat")?.name || userName;
+            if (like.authorType === "user") return userName;
             if (like.authorId === characterId) return charName;
             if (like.authorType === "npc") return like.authorName || "未知";
             return chars.find(ch => ch.id === like.authorId)?.name ?? "未知";
@@ -497,7 +453,7 @@ function* assembleNativeTimeline(
 
         // Resolve comment author name
         const resolveCommentName = (c: typeof filteredComments[number]): string => {
-            if (c.authorType === "user") return resolveChatAccountUserIdentity(c.chatAccountId, characterId, "chat")?.name || userName;
+            if (c.authorType === "user") return userName;
             if (c.authorId === characterId) return charName;
             if (c.authorType === "npc") return c.authorName!;
             return chars.find(ch => ch.id === c.authorId)?.name ?? "未知";
@@ -568,11 +524,12 @@ function* assembleNativeTimeline(
         afterTimestamp: options?.afterTimestamp,
         userName,
         charName,
+        memoryTarget: options?.memoryTarget,
     });
     for (const storyEntry of storyEntries) {
-        if (++processedMessages % 100 === 0) yield;
         entries.push({
             id: storyEntry.id,
+            sessionId: storyEntry.sessionId,
             sourceApp: "story",
             sourceDetail: "story",
             timestamp: storyEntry.timestamp,
@@ -589,7 +546,6 @@ function* assembleNativeTimeline(
     const offlineEntries = loadChatOfflineProjectionEntries(characterId, {
         afterTimestamp: options?.afterTimestamp,
         excludeSessionId: options?.excludeOfflineSessionId,
-        chatAccountId: options?.chatAccountId,
     });
     for (const offlineEntry of offlineEntries) {
         entries.push({
@@ -632,7 +588,6 @@ function* assembleNativeTimeline(
         afterTimestamp: options?.afterTimestamp,
     });
     for (const vnEntry of vnEntries) {
-        if (++processedMessages % 100 === 0) yield;
         entries.push({
             id: vnEntry.id,
             sourceApp: "vn",
@@ -688,7 +643,6 @@ function* assembleNativeTimeline(
         afterTimestamp: options?.afterTimestamp,
     });
     for (const gameEntry of gameEntries) {
-        if (++processedMessages % 100 === 0) yield;
         entries.push({
             id: gameEntry.id,
             sourceApp: "game",
@@ -705,7 +659,6 @@ function* assembleNativeTimeline(
         && (!options?.afterTimestamp || entry.createdAt > options.afterTimestamp)
     );
     for (const diaryEntry of diaryEntries) {
-        if (++processedMessages % 100 === 0) yield;
         entries.push({
             id: diaryEntry.id,
             sourceApp: "diary",
@@ -721,7 +674,6 @@ function* assembleNativeTimeline(
         afterTimestamp: options?.afterTimestamp,
     });
     for (const noteWallEntry of noteWallEntries) {
-        if (++processedMessages % 100 === 0) yield;
         entries.push({
             id: noteWallEntry.id,
             sourceApp: "diary",
@@ -742,7 +694,6 @@ function* assembleNativeTimeline(
         afterTimestamp: options?.afterTimestamp,
     });
     for (const xiaohongshuEntry of xiaohongshuEntries) {
-        if (++processedMessages % 100 === 0) yield;
         entries.push({
             id: xiaohongshuEntry.id,
             sourceApp: "xiaohongshu",
@@ -763,7 +714,6 @@ function* assembleNativeTimeline(
         afterTimestamp: options?.afterTimestamp,
     });
     for (const checkPhoneEntry of checkPhoneEntries) {
-        if (++processedMessages % 100 === 0) yield;
         const rendered = renderCharacterMacro(renderUserNameMacro(checkPhoneEntry.content, userName), charName);
         entries.push({
             id: checkPhoneEntry.id,
@@ -785,7 +735,6 @@ function* assembleNativeTimeline(
         afterTimestamp: options?.afterTimestamp,
     });
     for (const interviewEntry of interviewEntries) {
-        if (++processedMessages % 100 === 0) yield;
         entries.push({
             id: interviewEntry.id,
             sourceApp: "interview_magazine",
@@ -806,7 +755,6 @@ function* assembleNativeTimeline(
         afterTimestamp: options?.afterTimestamp,
     });
     for (const cocreateEntry of cocreateEntries) {
-        if (++processedMessages % 100 === 0) yield;
         entries.push({
             id: cocreateEntry.id,
             sourceApp: "cocreate",
@@ -828,11 +776,16 @@ function* assembleNativeTimeline(
         afterTimestamp: options?.afterTimestamp,
     });
     for (const customEntry of customAppEntries) {
-        if (++processedMessages % 100 === 0) yield;
         const label = customEntry.appLabel || customEntry.appName || "APP";
+        const specialSource = customEntry.appId === "life" ? "life"
+            : customEntry.appId === "photo_wall" ? "photo_wall"
+            : customEntry.appId === "phone_widget" ? "phone_widget"
+            : customEntry.appId === "watch" ? "watch"
+            : customEntry.appId === "global_watch" ? "global_watch"
+            : "custom_app";
         entries.push({
             id: customEntry.id,
-            sourceApp: "custom_app",
+            sourceApp: specialSource,
             sourceDetail: "custom_app_event",
             authorType: "user",
             timestamp: customEntry.createdAt,
@@ -848,29 +801,112 @@ function* assembleNativeTimeline(
         });
     }
 
-    return mergeShortMemoryEntries(characterId, entries, options?.includeDeleted, options?.afterTimestamp);
-}
-
-export function loadNativeTimeline(...args: Parameters<typeof assembleNativeTimeline>): NativeTimelineEntry[] {
-    const iterator = assembleNativeTimeline(...args);
-    let step = iterator.next();
-    while (!step.done) step = iterator.next();
-    return step.value;
-}
-
-export async function loadNativeTimelineAsync(...args: Parameters<typeof assembleNativeTimeline>): Promise<NativeTimelineEntry[]> {
-    const iterator = assembleNativeTimeline(...args);
-    let step = iterator.next();
-    while (!step.done) {
-        if (args[1]?.signal?.aborted) throw new DOMException("扫描已停止", "AbortError");
-        await new Promise<void>(resolve => setTimeout(resolve, 0));
-        step = iterator.next();
+    // ── Completed Photo Wall co-creation records: one event per saved creation session. ──
+    const photoWall = loadPhotoWallState();
+    const photoById = new Map(photoWall.photos.map(photo => [photo.id, photo]));
+    for (const record of photoWall.creationRecords ?? []) {
+        if (options?.afterTimestamp && record.createdAt <= options.afterTimestamp) continue;
+        const linkedPhotos = record.photoIds.map(photoId => photoById.get(photoId)).filter(Boolean);
+        // Public wall semantics: every saved creation is visible to every character.
+        // Do not gate shared-wall history on photo-level share flags or author identity.
+        const photoNames = linkedPhotos.map(photo => photo?.title).filter(Boolean).slice(0, 4);
+        const summary = [record.authorName + "完成了一次照片墙共同创作", record.narrative, photoNames.length ? "关联照片：" + photoNames.join("、") : ""].filter(Boolean).join("；");
+        entries.push({
+            id: "photo_wall_creation:" + record.id,
+            sourceApp: "photo_wall",
+            sourceDetail: "photo_wall_creation",
+            authorType: record.authorType,
+            timestamp: record.createdAt,
+            customAppId: "photo_wall",
+            customAppName: "照片墙",
+            customAppLabel: "共同创作",
+            content: formatStoredPromptEventContent(renderUserNameMacro(summary, userName), {
+                label: "照片墙共同创作", timestamp: record.createdAt, timeAware, timestampOptions,
+            }),
+        });
     }
-    return step.value;
+
+    // ── Shared Life timeline (scene actions, whereabouts, schedules and tools) ──
+    // Native chat, moments and diary content already has dedicated projections above.
+    // Only add Life-specific events here to avoid duplicate memory injection.
+    const lifeState = loadVirtualLifeState();
+    // Historical shared experiences remain visible even if the user temporarily disables
+    // the Life engine; disabling the engine pauses new simulation, not stored memories.
+    for (const fact of lifeState.memories ?? []) {
+        if (!fact.participants.includes(characterId)) continue;
+        if (options?.afterTimestamp && fact.occurredAt <= options.afterTimestamp) continue;
+        entries.push({
+            id: "life_shared_event:" + fact.id,
+            sourceApp: "life",
+            sourceDetail: "life_shared_event",
+            authorType: "user",
+            timestamp: fact.occurredAt,
+            customAppId: "life",
+            customAppName: "生活",
+            customAppLabel: "共同经历",
+            content: formatStoredPromptEventContent(renderUserNameMacro(fact.fact, userName), {
+                label: "共同经历", timestamp: fact.occurredAt, timeAware, timestampOptions,
+            }),
+        });
+    }
+    if (lifeState.settings.enabled) {
+        const characterSceneIds = new Set(
+            lifeState.scenes
+                .filter(scene => scene.participants.some(participant =>
+                    participant.ownerType === "character" && participant.ownerId === characterId
+                ))
+                .map(scene => scene.id)
+        );
+        const characterInvitationIds = new Set(
+            lifeState.invitations
+                .filter(invitation => invitation.characterId === characterId)
+                .map(invitation => invitation.id)
+        );
+        for (const lifeEntry of lifeState.timeline ?? []) {
+            if (options?.afterTimestamp && (lifeEntry.recordedAt ?? lifeEntry.occurredAt) <= options.afterTimestamp) continue;
+            if (!["location", "scene", "action", "dialogue", "schedule", "tool", "system"].includes(lifeEntry.category)) continue;
+            const belongsToCharacter = lifeEntry.actorId === characterId
+                || (!!lifeEntry.sceneId && characterSceneIds.has(lifeEntry.sceneId))
+                || (!!lifeEntry.sourceId && characterInvitationIds.has(lifeEntry.sourceId));
+            if (!belongsToCharacter) continue;
+            // 玩家自己的生活记录在角色记忆里用 {{user}} 做主语，避免第一人称“我”被当成角色自己的经历。
+            const subject = asPlayerRecordSubject(lifeEntry, lifeState.settings.playerDisplayName);
+            const title = clipTimelineText(subject.title, 180);
+            const details = clipTimelineText(lifeEntry.details ?? "", 500);
+            const label = lifeEntry.category === "dialogue" ? "共同场景对话"
+                : lifeEntry.category === "action" ? "共同场景行动"
+                : lifeEntry.category === "tool" ? "角色工具调用"
+                : lifeEntry.category === "schedule" ? "日程变化"
+                : lifeEntry.category === "location" ? "地点变化"
+                : "生活记录";
+            entries.push({
+                id: "life:" + lifeEntry.id,
+                sourceApp: "life",
+                sourceDetail: "custom_app_event",
+                authorType: lifeEntry.actorId === characterId ? "character" : "user",
+                timestamp: lifeEntry.occurredAt,
+                customAppId: "life",
+                customAppName: "生活",
+                customAppLabel: label,
+                content: formatStoredPromptEventContent(
+                    renderUserNameMacro([title, details].filter(Boolean).join("："), userName),
+                    { label: "生活", timestamp: lifeEntry.occurredAt, timeAware, timestampOptions },
+                ),
+            });
+        }
+    }
+
+    // Sort by timestamp ascending
+    entries.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    return entries;
 }
 
 // Fixed order — lower = further from LLM output (appears higher in prompt)
 const FEATURE_ORDER: Record<string, number> = { map: 0, game: 0.5, moments: 1, xiaohongshu: 1.5, checkphone: 1.7, story: 2, vn: 2, theater: 2.2, interview: 2.35, cocreate: 2.4, diary_entry: 2.45, notewall: 2.5, custom_app: 2.6, group_chat: 3, chat: 4 };
+// First-class app timelines share the custom-app prompt block and ordering.
+const CUSTOM_APP_TIMELINE_SOURCES = new Set<string>([
+    "custom_app", "photo_wall", "watch", "phone_widget", "life",
+]);
 // Map appId → XML tag name for the "current feature" wrapper
 const FEATURE_TAG: Record<string, string> = {
     chat: "recent_chat",
@@ -888,7 +924,7 @@ const FEATURE_TAG: Record<string, string> = {
 };
 
 function getFeatureTag(appId: string): string {
-    return appId === "custom_app" || appId.startsWith("custom_app:") ? "recent_custom_app" : FEATURE_TAG[appId] ?? FEATURE_TAG.chat;
+    return CUSTOM_APP_TIMELINE_SOURCES.has(appId) || appId.startsWith("custom_app:") ? "recent_custom_app" : FEATURE_TAG[appId] ?? FEATURE_TAG.chat;
 }
 
 function isChatOfflineEntry(entry: NativeTimelineEntry): boolean {
@@ -996,6 +1032,13 @@ export function filterTimelineByAllowedSources(
  * For history-style appIds, the current feature's block has empty content because
  * the actual content is the history turns (wrapped by the assembler).
  */
+/** 按当前消费 APP 限制总注入条数；原始来源数据始终保留在各自存储中。 */
+function limitTimelineForApp<T>(entries: T[], appId: string, limits?: Record<string, unknown>): T[] {
+    const raw = limits?.[appId];
+    const limit = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+    return limit ? entries.slice(-limit) : entries;
+}
+
 export function prepareShortTermContext(
     characterId: string,
     appId: string,
@@ -1006,12 +1049,13 @@ export function prepareShortTermContext(
         excludeOfflineSessionId?: string;
         includeNativeToolHistory?: boolean;
         includeDirectChatEntries?: boolean;
-        /** 限定聊天账号；undefined 表示不限制，null 表示主号。 */
-        chatAccountId?: string | null;
-        excludeChatSessionId?: string;
-        timeline?: NativeTimelineEntry[];
         /** 只读取该时间之后的跨应用最近事件；剧情分线用它隔离创建前的短期记忆。 */
         afterTimestamp?: string;
+        /** false 时仅保留剧情 APP 时间线，不读取其他 APP 的相关事件。 */
+        includeOtherApps?: boolean;
+        /** false 时排除其他剧情分线写入公共时间线的事件（只影响 story）。 */
+        includeStoryPublic?: boolean;
+        memoryTarget?: "short_term" | "long_term" | "core";
         timeAware?: boolean;
         promptTimestampOptions?: PromptTimestampOptions;
     },
@@ -1022,26 +1066,36 @@ export function prepareShortTermContext(
     unifiedRecentItems: UnifiedRecentItem[];
 } {
     const timeAware = resolvePromptTimeAware(options?.timeAware);
-    let timeline = options?.timeline ?? loadNativeTimeline(characterId, {
+    let timeline = loadNativeTimeline(characterId, {
         userName: options?.userName,
         appId: appId as import("./settings-types").ContentAppId,
         excludeOfflineSessionId: options?.excludeOfflineSessionId,
-        chatAccountId: undefined,
-        excludeChatSessionId: options?.excludeChatSessionId ?? (appId === "chat" && !options?.includeDirectChatEntries ? options?.history?.[0]?.sessionId : undefined),
         afterTimestamp: options?.afterTimestamp,
+        memoryTarget: options?.memoryTarget,
         timeAware,
         promptTimestampOptions: options?.promptTimestampOptions,
     });
 
+    if (options?.includeOtherApps === false) {
+        timeline = timeline.filter((entry) => entry.sourceApp === "story");
+    }
+    if (options?.includeStoryPublic === false) {
+        timeline = timeline.filter((entry) => entry.sourceApp !== "story");
+    }
     const memConfig = loadMemoryConfig();
-    timeline = filterTimelineByAllowedSources(mergeShortMemoryEntries(characterId, timeline, false, options?.afterTimestamp), memConfig.shortTermAllowedSources);
+    timeline = filterTimelineByAllowedSources(timeline, memConfig.shortTermAllowedSources);
+    timeline = limitTimelineForApp(timeline, appId, memConfig.shortTermAppLimits as Record<string, unknown> | undefined);
 
     // Activation context: full timeline for keyword matching (not truncated)
     const wbActivationContext = timeline.slice(-10).map(e => e.content).join("\n");
     const budget = memConfig.shortTermTokenBudget;
     const currentTag = getFeatureTag(appId);
-    const history = applyShortMemoryToChatHistory(characterId, options?.history ?? [], appId);
-    const currentHistoryKeys = new Set(history.map(message => `${message.sessionId}\u0000${message.id}`));
+    const history = options?.history ?? [];
+    // Offline/life callers often pass the online chat as `history`; keep those
+    // messages once (in history) instead of injecting the same rows again as
+    // `recent_chat`. This preserves the online-chat memory while avoiding the
+    // duplicate block that used to over-weight old topics.
+    const historyMessageIds = new Set(history.map(message => message.id));
     const characterName = loadCharacters().find(c => c.id === characterId)?.name ?? "角色";
     const wrapsCurrentHistory = appId === "chat" || appId === "group_chat" || appId === "story" || appId === "vn" || appId === "adventure";
     const skipDirectChatEntries = appId === "chat" && !options?.includeDirectChatEntries;
@@ -1055,10 +1109,9 @@ export function prepareShortTermContext(
         raw.push({ tag: "recent_moments", order: FEATURE_ORDER.moments, entries: momentsEntries });
     }
 
-    if (appId !== "story" || timeline.some(entry => entry.sourceApp === "story" && entry.memorySupplement)) {
+    if (appId !== "story") {
         const storyEntries = timeline.filter(e =>
             e.sourceApp === "story"
-            && (appId !== "story" || e.memorySupplement)
             && e.sourceDetail !== "black_market_theater"
             && !isChatOfflineEntry(e)
         );
@@ -1072,8 +1125,8 @@ export function prepareShortTermContext(
         raw.push({ tag: "recent_theater", order: FEATURE_ORDER.theater, entries: theaterEntries });
     }
 
-    if (appId !== "vn" || timeline.some(entry => entry.sourceApp === "vn" && entry.memorySupplement)) {
-        const vnEntries = timeline.filter(e => e.sourceApp === "vn" && (appId !== "vn" || e.memorySupplement));
+    if (appId !== "vn") {
+        const vnEntries = timeline.filter(e => e.sourceApp === "vn");
         if (vnEntries.length > 0) {
             raw.push({ tag: "recent_events", order: FEATURE_ORDER.vn, entries: vnEntries });
         }
@@ -1122,7 +1175,7 @@ export function prepareShortTermContext(
         raw.push({ tag: "recent_cocreate", order: FEATURE_ORDER.cocreate, entries: cocreateEntries });
     }
 
-    const customAppEntries = timeline.filter(e => e.sourceApp === "custom_app");
+    const customAppEntries = timeline.filter(e => CUSTOM_APP_TIMELINE_SOURCES.has(e.sourceApp));
     if (customAppEntries.length > 0) {
         raw.push({ tag: "recent_custom_app", order: FEATURE_ORDER.custom_app, entries: customAppEntries });
     }
@@ -1137,15 +1190,16 @@ export function prepareShortTermContext(
     }
 
     // Direct chat from timeline — skipped only when the current history already comes from chat/group_chat.
+    // Also skip rows already present in `history` (offline/life callers pass online chat as history).
     if (!skipDirectChatEntries) {
-        const chatEntries = timeline.filter(e => e.sourceApp === "chat" && e.sourceDetail === "direct");
+        const chatEntries = timeline.filter(e =>
+            e.sourceApp === "chat"
+            && e.sourceDetail === "direct"
+            && !historyMessageIds.has(e.id),
+        );
         if (chatEntries.length > 0) {
             raw.push({ tag: "recent_chat", order: FEATURE_ORDER.chat, entries: chatEntries });
         }
-    }
-    if (skipDirectChatEntries) {
-        const otherChats = timeline.filter(e => e.sourceApp === "chat" && e.sourceDetail === "direct" && (e.sessionId !== options?.excludeChatSessionId || (e.memorySupplement && !currentHistoryKeys.has(`${e.sessionId}\u0000${e.id}`))));
-        if (otherChats.length) raw.push({ tag: "recent_chat", order: FEATURE_ORDER.chat, entries: otherChats });
     }
 
     const offlineGroupChatEntries = timeline.filter(e => isChatOfflineEntry(e) && e.groupSessionId);
@@ -1185,9 +1239,8 @@ export function prepareShortTermContext(
     const entryMeta = new Map<string, { entry: NativeTimelineEntry; sourceTag: string }>();
     for (const r of raw) {
         for (const e of r.entries) {
-            const key = getNativeTimelineEntryKey(e);
-            entryMeta.set(key, { entry: e, sourceTag: r.tag });
-            pool.push({ kind: "entry", timestamp: e.timestamp, tokens: estimateTokens(e.content) + 4, entryId: key, sourceTag: r.tag });
+            entryMeta.set(e.id, { entry: e, sourceTag: r.tag });
+            pool.push({ kind: "entry", timestamp: e.timestamp, tokens: estimateTokens(e.content) + 4, entryId: e.id, sourceTag: r.tag });
         }
     }
     for (let i = 0; i < history.length; i++) {
@@ -1229,7 +1282,7 @@ export function prepareShortTermContext(
     // Build recentBlocks from surviving entries
     const recentBlocks: RecentBlock[] = [];
     for (const r of raw) {
-        const surviving = r.entries.filter(e => survivingEntryIds.has(getNativeTimelineEntryKey(e)));
+        const surviving = r.entries.filter(e => survivingEntryIds.has(e.id));
         if (surviving.length === 0) continue;
         recentBlocks.push({ tag: r.tag, content: surviving.map(e => e.content).join("\n\n") });
     }
@@ -1268,7 +1321,7 @@ export function prepareShortTermContext(
 }
 
 function buildNativeTimelineKey(entry: NativeTimelineEntry): string {
-    return getNativeTimelineEntryKey(entry);
+    return [entry.sourceApp, entry.sourceDetail ?? "", entry.groupSessionId ?? "", entry.id].join(":");
 }
 
 export function prepareGroupShortTermContext(
@@ -1279,8 +1332,6 @@ export function prepareGroupShortTermContext(
         excludeGroupSessionId?: string;
         excludeOfflineSessionId?: string;
         includeNativeToolHistory?: boolean;
-        chatAccountId?: string | null;
-        timelines?: Map<string, NativeTimelineEntry[]>;
         timeAware?: boolean;
         promptTimestampOptions?: PromptTimestampOptions;
     },
@@ -1290,34 +1341,30 @@ export function prepareGroupShortTermContext(
     unifiedRecentItems: UnifiedRecentItem[];
 } {
     const uniqueCharacterIds = [...new Set(characterIds)];
-    for (const characterId of uniqueCharacterIds) history = applyShortMemoryToChatHistory(characterId, history, "group_chat");
-    const currentHistoryKeys = new Set(history.map(message => `${message.sessionId}\u0000${message.id}`));
     const timelineByKey = new Map<string, NativeTimelineEntry>();
     const timeAware = resolvePromptTimeAware(options?.timeAware);
     const memConfig = loadMemoryConfig();
     const allowed = memConfig.shortTermAllowedSources ?? {};
 
     for (const characterId of uniqueCharacterIds) {
-        let timeline = options?.timelines?.get(characterId) ?? loadNativeTimeline(characterId, {
+        let timeline = loadNativeTimeline(characterId, {
             userName: options?.userName,
             appId: "group_chat",
             excludeOfflineSessionId: options?.excludeOfflineSessionId,
-            chatAccountId: undefined,
             timeAware,
             promptTimestampOptions: options?.promptTimestampOptions,
         });
-        timeline = filterTimelineByAllowedSources(mergeShortMemoryEntries(characterId, timeline), allowed);
+        timeline = filterTimelineByAllowedSources(timeline, allowed);
+        timeline = limitTimelineForApp(timeline, "group_chat", memConfig.shortTermAppLimits as Record<string, unknown> | undefined);
         for (const entry of timeline) {
-            if (entry.sourceApp === "chat" && entry.sourceDetail === "group" && entry.groupSessionId === options?.excludeGroupSessionId
-                && (!entry.memorySupplement || currentHistoryKeys.has(`${entry.groupSessionId}\u0000${entry.id}`))) {
+            if (entry.sourceApp === "chat" && entry.sourceDetail === "group" && entry.groupSessionId === options?.excludeGroupSessionId) {
                 continue;
             }
             timelineByKey.set(buildNativeTimelineKey(entry), entry);
         }
     }
 
-    const deleted = new Set(uniqueCharacterIds.flatMap(id => [...hiddenMemoryKeys(id)]));
-    const timeline = [...timelineByKey.values()].filter(entry => !isMemoryEntryDeleted(entry, deleted)).sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    const timeline = [...timelineByKey.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
     const activationPool = [
         ...timeline.map(entry => ({ timestamp: entry.timestamp, content: entry.content })),
         ...history.filter(msg => msg.mediaType !== "tool_notice").map(msg => ({ timestamp: msg.createdAt, content: msg.content })),
@@ -1392,7 +1439,7 @@ export function prepareGroupShortTermContext(
         raw.push({ tag: "recent_cocreate", order: FEATURE_ORDER.cocreate, entries: cocreateEntries });
     }
 
-    const customAppEntries = timeline.filter(e => e.sourceApp === "custom_app");
+    const customAppEntries = timeline.filter(e => CUSTOM_APP_TIMELINE_SOURCES.has(e.sourceApp));
     if (customAppEntries.length > 0) {
         raw.push({ tag: "recent_custom_app", order: FEATURE_ORDER.custom_app, entries: customAppEntries });
     }
@@ -1490,7 +1537,7 @@ export function prepareGroupShortTermContext(
                                     entry.sourceApp === "checkphone" ? "recent_checkphone" :
                                         entry.sourceApp === "interview_magazine" ? "recent_interview" :
                                                 entry.sourceApp === "cocreate" ? "recent_cocreate" :
-                                                    entry.sourceApp === "custom_app" ? "recent_custom_app" :
+                                                    CUSTOM_APP_TIMELINE_SOURCES.has(entry.sourceApp) ? "recent_custom_app" :
                                                         entry.sourceApp === "story" && entry.sourceDetail === "black_market_theater" ? "recent_theater" :
                                                             entry.sourceApp === "diary" && entry.sourceDetail === "diary_entry" ? "recent_diary" :
                                                                 entry.sourceApp === "diary" && entry.sourceDetail === "notewall" ? "recent_notewall" :

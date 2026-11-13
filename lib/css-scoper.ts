@@ -27,7 +27,7 @@ export function extractCssImports(raw: string): { imports: string[]; css: string
  * - `@keyframes` / `@font-face` blocks are passed through unchanged.
  * - Media queries are handled recursively.
  */
-export function scopeSessionCSS(raw: string, scopeSelector: string, priority = false): string {
+export function scopeSessionCSS(raw: string, scopeSelector: string): string {
   if (!raw.trim()) return "";
 
   const result: string[] = [];
@@ -60,9 +60,8 @@ export function scopeSessionCSS(raw: string, scopeSelector: string, priority = f
         const atName = atRuleMatch[1].toLowerCase();
 
         // @import — pass through unchanged (e.g. Google Fonts)
-        const boundary = findSyntaxBoundary(raw, i, "{;");
-        if (boundary >= 0 && raw[boundary] === ";") {
-          const semiEnd = boundary;
+        if (atName === "import") {
+          const semiEnd = raw.indexOf(";", i);
           if (semiEnd === -1) {
             result.push(raw.slice(i));
             break;
@@ -73,8 +72,8 @@ export function scopeSessionCSS(raw: string, scopeSelector: string, priority = f
         }
 
         // Pass-through rules (don't scope)
-        if (atName.endsWith("keyframes") || atName === "font-face" || atName === "property") {
-          const braceStart = findSyntaxBoundary(raw, i, "{");
+        if (atName === "keyframes" || atName === "font-face") {
+          const braceStart = raw.indexOf("{", i);
           if (braceStart === -1) {
             result.push(raw.slice(i));
             break;
@@ -86,8 +85,8 @@ export function scopeSessionCSS(raw: string, scopeSelector: string, priority = f
         }
 
         // Media queries and other container rules — recurse into body
-        if (["media", "supports", "layer", "container", "starting-style"].includes(atName)) {
-          const braceStart = findSyntaxBoundary(raw, i, "{");
+        if (atName === "media" || atName === "supports" || atName === "layer") {
+          const braceStart = raw.indexOf("{", i);
           if (braceStart === -1) {
             result.push(raw.slice(i));
             break;
@@ -96,7 +95,7 @@ export function scopeSessionCSS(raw: string, scopeSelector: string, priority = f
           const prelude = raw.slice(i, braceStart + 1);
           const body = raw.slice(braceStart + 1, blockEnd);
           result.push(prelude);
-          result.push(scopeSessionCSS(body, scopeSelector, priority));
+          result.push(scopeSessionCSS(body, scopeSelector));
           result.push("}");
           i = blockEnd + 1;
           continue;
@@ -105,7 +104,7 @@ export function scopeSessionCSS(raw: string, scopeSelector: string, priority = f
     }
 
     // Regular rule: selector { ... }
-    const braceStart = findSyntaxBoundary(raw, i, "{");
+    const braceStart = raw.indexOf("{", i);
     if (braceStart === -1) {
       // No more braces — remaining text is malformed, just push it
       result.push(raw.slice(i));
@@ -117,8 +116,9 @@ export function scopeSessionCSS(raw: string, scopeSelector: string, priority = f
     const body = raw.slice(braceStart, blockEnd + 1);
 
     // Scope each selector in comma-separated list
-    const scopedSelector = splitSelectors(selectorText)
-      .map((sel) => scopeSingleSelector(sel.trim(), scopeSelector, priority))
+    const scopedSelector = selectorText
+      .split(",")
+      .map((sel) => scopeSingleSelector(sel.trim(), scopeSelector))
       .join(", ");
 
     result.push(scopedSelector + " " + body);
@@ -128,65 +128,42 @@ export function scopeSessionCSS(raw: string, scopeSelector: string, priority = f
   return result.join("");
 }
 
-function scopeSingleSelector(sel: string, scope: string, priority: boolean): string {
+function scopeSingleSelector(sel: string, scope: string): string {
   if (!sel) return sel;
-  // Increase specificity instead of forcing !important, which would disable animations.
-  const target = priority ? `${scope}:not(#story-css-priority-reserved)` : scope;
   const lower = sel.toLowerCase();
   // Replace body/html/:root with the scope selector
   if (lower === "body" || lower === "html" || lower === ":root") {
-    return target;
+    return scope;
   }
   // Selectors starting with body/html/:root — replace the element part
-  if (/^(body|html|:root)(?=[\s.:[#>+~])/i.test(sel)) {
-    return target + sel.replace(/^(body|html|:root)/i, "");
+  if (/^(body|html|:root)\s/i.test(sel)) {
+    return scope + " " + sel.replace(/^(body|html|:root)\s*/i, "");
+  }
+  if (/^(body|html|:root)\./i.test(sel)) {
+    return scope + sel.replace(/^(body|html|:root)/i, "");
   }
   // 选择器就是 scope 本身（如用户写 .chat-app { --var: ... }）：直接返回 scope，
   // 否则会被错误地变成 ".chat-app .chat-app"，导致变量没法挂到 scope 元素上
   if (sel === scope) {
-    return target;
+    return scope;
   }
   // 选择器以 scope 开头并跟着空格/伪类/属性（如 .chat-app .foo / .chat-app:hover / .chat-app[data-x]）：
   // 已经包含 scope 了，不要重复前缀，否则也会失效
   if (sel.startsWith(scope + " ") || sel.startsWith(scope + ":") || sel.startsWith(scope + "[") || sel.startsWith(scope + ".") || sel.startsWith(scope + ">")) {
-    return target + sel.slice(scope.length);
+    return sel;
   }
   // Normal selector — prefix with scope
-  return target + " " + sel;
-}
-
-/** Ignore punctuation inside strings, comments, attribute selectors and functions. */
-function findSyntaxBoundary(text: string, start: number, delimiters: string): number {
-  let quote = "", depth = 0;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === "\\") { i++; continue; }
-    if (quote) { if (ch === quote) quote = ""; continue; }
-    if (ch === '"' || ch === "'") { quote = ch; continue; }
-    if (ch === "/" && text[i + 1] === "*") { const end = text.indexOf("*/", i + 2); if (end < 0) return -1; i = end + 1; continue; }
-    if (ch === "(" || ch === "[") depth++;
-    else if (ch === ")" || ch === "]") depth--;
-    else if (!depth && delimiters.includes(ch)) return i;
-  }
-  return -1;
-}
-
-function splitSelectors(text: string): string[] {
-  const result: string[] = [];
-  let start = 0, end: number;
-  while ((end = findSyntaxBoundary(text, start, ",")) >= 0) { result.push(text.slice(start, end)); start = end + 1; }
-  result.push(text.slice(start));
-  return result;
+  return scope + " " + sel;
 }
 
 function findMatchingBrace(text: string, openPos: number): number {
-  let depth = 1, index = openPos + 1;
-  while (index < text.length) {
-    const next = findSyntaxBoundary(text, index, "{}");
-    if (next < 0) break;
-    depth += text[next] === "{" ? 1 : -1;
-    if (!depth) return next;
-    index = next + 1;
+  let depth = 0;
+  for (let i = openPos; i < text.length; i++) {
+    if (text[i] === "{") depth++;
+    else if (text[i] === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
   }
   return text.length - 1;
 }

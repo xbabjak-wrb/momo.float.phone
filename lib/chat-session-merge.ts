@@ -54,11 +54,10 @@ function sessionActivityTime(session: ChatSession): number {
 }
 
 function duplicateKey(session: ChatSession): string | null {
-    const accountScope = session.chatAccountId || "main";
-    if (!session.isGroup) return `account:${accountScope}:direct:${session.contactId}`;
+    if (!session.isGroup) return `direct:${session.contactId}`;
     const members = [...(session.participantIds || [])].sort();
     if (members.length === 0) return null;
-    return `account:${accountScope}:group:${session.isSpectator ? "1" : "0"}:${members.join(",")}`;
+    return `group:${session.isSpectator ? "1" : "0"}:${members.join(",")}`;
 }
 
 export function findDuplicateSessionGroups(): DuplicateSessionGroup[] {

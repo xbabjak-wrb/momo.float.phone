@@ -3,15 +3,16 @@
 import { Component, memo, useCallback, useEffect, useInsertionEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ErrorInfo, type ReactNode } from "react";
 
 import { updateStatusBarTone } from "@/lib/bg-tone";
+import { loadDeviceCompatibilitySettings } from "@/lib/device-compatibility";
 import { startDiaryEntryTimerService, stopDiaryEntryTimerService } from "@/lib/diary-entry-timer-service";
 import { startFollowUpService, stopFollowUpService } from "@/lib/follow-up-service";
+import { installLifeScheduleProactiveScheduler } from "@/lib/life/life-proactive-scheduler";
 import { startMomentsService, stopMomentsService } from "@/lib/moments-engine";
 import { bgTimerCleanup } from "@/lib/bg-timer";
 import { PhoneThemeApp } from "@/components/phone-theme-app";
 import { PhoneCharacterApp } from "@/components/phone-character-app";
 import { PhoneSettingsApp } from "@/components/phone-settings-app";
 import { PhoneChatApp } from "@/components/chat/phone-chat-app";
-import { FavoritesApp } from "@/components/favorites/favorites-app";
 import { PhonePlaceholderApp } from "@/components/phone-placeholder-app";
 import MusicApp from "@/components/music/music-app";
 import MusicPlayer from "@/components/music/music-player";
@@ -27,11 +28,17 @@ import { REALITY_BRIDGE_APP_EVENT_NAME, REALITY_BRIDGE_DATA_EVENT } from "@/lib/
 import { DiaryApp } from "@/components/diary/diary-app";
 import { XiaohongshuApp } from "@/components/xiaohongshu/xiaohongshu-app";
 import { StoryApp } from "@/components/story/story-app";
+import { LifeEngineApp } from "@/components/life/life-engine-app";
+import { ArchiveRoomApp } from "@/components/archive-room-app";
+import { PhotoWallApp } from "@/components/photo-wall-app";
+import { WatchTogetherApp } from "@/components/watch-together-app";
+import { CALL_STATS_ENTRY_HTML } from "@/lib/builtin-apps/call-stats-source";
 import { VnApp } from "@/components/vn/vn-app";
 import ReadingApp from "@/components/reading/reading-app";
 import MapApp from "@/components/map/map-app";
 import { DwellingApp } from "@/components/dwelling/dwelling-app";
 import { MascotFloat } from "@/components/mascot/mascot-float";
+import { PerceptionBootstrap } from "@/components/perception/perception-bootstrap";
 import { MascotPreviewHost } from "@/components/mascot/mascot-preview-host";
 import { useMusicControlsOptional } from "@/lib/music-context";
 import { PhoneResourcesApp, type ResourceSubPage } from "@/components/phone-resources-app";
@@ -58,6 +65,7 @@ import {
   PAGE_1_DEFAULT,
   PAGE_2_DEFAULT,
   PAGE_3_DEFAULT,
+  PAGE_4_DEFAULT,
   createFolderIconId,
   isFolderIconId,
   type DesktopIconId,
@@ -135,6 +143,7 @@ import { parseAIResponse } from "@/lib/rich-message-parser";
 import { requestBackgroundChatReply, scheduleFollowUp } from "@/lib/follow-up-service";
 import { CHAT_MESSAGE_NOTICE_EVENT, CHAT_OPEN_SESSION_EVENT, type ChatMessageNoticeDetail } from "@/lib/chat-notification-events";
 import { startIncomingCallVibration } from "@/lib/call-vibration";
+import { CallLayer } from "@/components/chat/call-layer";
 import { installChatSoundListener, playChatSoundOnce, setMiniChatSoundSessionId, startChatSoundLoop } from "@/lib/chat-sound";
 import { setMascotContext } from "@/lib/mascot-context";
 import { DESKTOP_WIDGETS_CHANGED_EVENT } from "@/lib/mascot-events";
@@ -142,15 +151,16 @@ import { useWeixinBridge } from "@/lib/use-weixin-bridge";
 import { startWeixinCloudRealtimeSync } from "@/lib/weixin-cloud-sync";
 import { WeixinSyncToast } from "@/components/weixin-sync-toast";
 import { sendBrowserNotification } from "@/lib/browser-notification";
+import { canSendShellNotification, sendShellNotification } from "@/lib/shell-notify";
 import type { ChatSharePayload } from "@/lib/chat-share";
 import { completePendingMcpOAuthCallback } from "@/lib/tool-executor";
 import { LayoutGrid, LoaderCircle, RefreshCw } from "lucide-react";
-import { loadChatScope, sessionMatchesChatScope } from "@/lib/chat-scope-storage";
 
 const EMOJI_FONTS = '"Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Twemoji Mozilla"';
 
 const ICON_LAYOUT_STORAGE_KEY = "ai_phone_icon_layout_v2";
 const ICON_LAYOUT_STORAGE_KEY_V1 = "ai_phone_icon_layout_v1";
+const NEW_LIFESTYLE_APPS_PAGE_MIGRATION_KEY = "ai_phone_new_lifestyle_apps_page4_v1";
 // Sentinel "page" used by the drag engine to mean "the dock". getDesktopPageNumber
 // returns 0 for it and getDesktopPageKeys filters it out, so page iteration never
 // treats the dock as a real page.
@@ -410,6 +420,40 @@ function getInstalledCustomIconIds(): Set<string> {
   return new Set(loadInstalledCustomApps().map(app => toCustomAppIconId(app.id)));
 }
 
+
+function migrateNewLifestyleAppsToPageFour(
+  layout: DesktopLayout,
+  widgets: WidgetInstance[],
+  dock: DesktopIconId[],
+  folders: DesktopFolderMap,
+): DesktopLayout {
+  if (kvGet(NEW_LIFESTYLE_APPS_PAGE_MIGRATION_KEY) === "1") return layout;
+  const movedIds = new Set<DesktopIconId>(["life", "archive", "photowall", "watchtogether"]);
+  const next = cloneDesktopLayout(layout, widgets);
+  for (const pageKey of getDesktopPageKeysForState(next, widgets)) {
+    next[pageKey] = (next[pageKey] ?? []).filter(icon => !movedIds.has(icon.id));
+  }
+  ensureDesktopPage(next, "page4" as DesktopPageKey);
+  const folderMembers = new Set(Object.values(folders).flatMap(folder => folder.icons));
+  const widgetOcc = buildWidgetOccupancy(widgets.filter(widget => widget.page === 4));
+  const usedCells = new Set((next.page4 ?? []).map(icon => `${icon.row},${icon.col}`));
+  for (const id of ["life", "archive", "photowall", "watchtogether"] as const) {
+    if (dock.includes(id) || folderMembers.has(id)) continue;
+    const desired = id === "life" ? { row: 3, col: 2 }
+      : id === "archive" ? { row: 3, col: 3 }
+      : id === "photowall" ? { row: 4, col: 2 }
+      : { row: 4, col: 3 };
+    const free = findNearestFreeCell(desired.row, desired.col, widgetOcc, usedCells);
+    if (!free) continue;
+    next.page4.push({ id, ...free });
+    usedCells.add(`${free.row},${free.col}`);
+  }
+  kvSet(NEW_LIFESTYLE_APPS_PAGE_MIGRATION_KEY, "1");
+  return next;
+}
+
+
+
 function migrateLegacyDesktopIconId(id: string, customIconIds = getInstalledCustomIconIds()): DesktopIconId | null {
   if (id === "weibo") return "game";
   if (id === "fortune") return "interview_magazine";
@@ -517,11 +561,14 @@ function normalizeLayout(raw: unknown, widgets: WidgetInstance[], dockIds: Set<D
   for (const folder of Object.values(folders)) {
     for (const memberId of folder.icons) allPlaced.add(memberId);
   }
-  const allDefaults = [...PAGE_1_DEFAULT, ...PAGE_2_DEFAULT, ...PAGE_3_DEFAULT, ...DOCK_DEFAULT];
+  // PAGE_4_DEFAULT 必须一并纳入兜底：生活/档案室/照片墙/一起看四个图标是后加的
+  // 独立页，漏了它们时一旦走「恢复默认外观 / 导入主题包 / 旧布局迁移」路径，
+  // 图标不被兜底就会被永久清掉，且每次重启都救不回（用户反馈过新增应用消失）。
+  const allDefaults = [...PAGE_1_DEFAULT, ...PAGE_2_DEFAULT, ...PAGE_3_DEFAULT, ...PAGE_4_DEFAULT, ...DOCK_DEFAULT];
 
   for (const id of allDefaults) {
     if (allPlaced.has(id) || dockIds.has(id)) continue;
-    const primaryPage = PAGE_1_DEFAULT.includes(id) ? 1 : PAGE_2_DEFAULT.includes(id) ? 2 : PAGE_3_DEFAULT.includes(id) ? 3 : 1;
+    const primaryPage = PAGE_1_DEFAULT.includes(id) ? 1 : PAGE_2_DEFAULT.includes(id) ? 2 : PAGE_3_DEFAULT.includes(id) ? 3 : PAGE_4_DEFAULT.includes(id) ? 4 : 1;
     // placeIconOnAvailablePage 页满会顺延到下一页乃至新开一页——
     // 曾经这里只在现有页里找空格，页面被图标和组件占满时就静默放弃，
     // 图标（如外观）从此永久丢失且每次重启都救不回
@@ -909,6 +956,16 @@ function measureTextareaCaretRect(textarea: HTMLTextAreaElement): KeyboardTarget
 }
 
 function getKeyboardTargetRect(element: HTMLElement): KeyboardTargetRect {
+  // 聊天输入栏 / 多选栏是“上输入框、下发送按钮”的竖向结构。
+  // 抬高的目标必须是整条栏子的 bottom（含发送按钮），而不是文字光标那一行，
+  // 否则只把输入框顶部抬到键盘上方、发送按钮仍被键盘盖住。
+  const inputBar = element.closest<HTMLElement>("[data-ui='input'], [data-ui='multi-select']");
+  if (inputBar) {
+    const rect = inputBar.getBoundingClientRect();
+    return { top: rect.top, bottom: rect.bottom };
+  }
+
+  // 其它独立输入框（设置项、文件夹重命名等）没有底部按钮，仍按原逻辑抬光标。
   if (element instanceof HTMLTextAreaElement) {
     return measureTextareaCaretRect(element);
   }
@@ -955,6 +1012,14 @@ function useAndroidCaretKeyboardLift() {
         return;
       }
 
+      // interactive-widget=resizes-content 生效时（布局视口被键盘原生压缩、innerHeight 变小），
+      // 键盘避让已由原生布局完成；此时再叠加手动 lift 会把输入栏顶离键盘，
+      // 在输入栏和键盘之间产生一条空白。检测到原生压缩标记时彻底关闭手动抬升。
+      if (document.documentElement.dataset.nativeKbResize === "1") {
+        applyLift(0);
+        return;
+      }
+
       const keyboardTop = viewport.offsetTop + viewport.height;
       const keyboardInset = Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);
       const targetRect = getKeyboardTargetRect(element);
@@ -977,14 +1042,18 @@ function useAndroidCaretKeyboardLift() {
 
     const handleFocusIn = (event: FocusEvent) => {
       const target = event.target;
-      if (!isKeyboardEditableElement(target)) return;
+      if (!isKeyboardEditableElement(target)) {
+        return;
+      }
       focusedElement = target;
       requestUpdate();
     };
 
     const handleFocusOut = () => {
       focusedElement = null;
-      applyLift(0);
+      // 失焦统一走 requestUpdate()：由 update() 依据当前状态清掉 lift（移除 --mobile-keyboard-lift）。
+      // 抬升已改用 margin-top（真实布局位移）实现，hit-test 始终与视觉同步，不再需要同步 applyLift(0)。
+      requestUpdate();
     };
 
     const handleCaretMove = () => {
@@ -1013,6 +1082,88 @@ function useAndroidCaretKeyboardLift() {
       viewport?.removeEventListener("resize", handleViewportChange);
       viewport?.removeEventListener("scroll", handleViewportChange);
       root.style.removeProperty("--mobile-keyboard-lift");
+    };
+  }, []);
+}
+
+/**
+ * Android 原生键盘适配（配合 app/layout.tsx 的 viewport interactive-widget=resizes-content）。
+ * 键盘弹出时浏览器会原生压缩布局视口（window.innerHeight 变小），这里把
+ * --phone-screen-height 实时同步为 (innerHeight + status-bar-drop)，使虚拟手机
+ * 整体压缩、输入栏天然贴在键盘上方——无需手动抬升，点击命中区域由原生布局保证。
+ * 旧版浏览器不支持 interactive-widget 时 innerHeight 不变，本 hook 等于空操作，
+ * 自动回退到 useAndroidCaretKeyboardLift 的手动抬升方案，两套机制不会叠加。
+ */
+function useAndroidNativeKeyboardViewport() {
+  useEffect(() => {
+    if (!/Android/i.test(navigator.userAgent)) {
+      return;
+    }
+    const mobileMq = window.matchMedia("(max-width: 500px) and (hover: none) and (pointer: coarse)");
+    if (!mobileMq.matches) {
+      return;
+    }
+
+    const root = document.documentElement;
+    let raf = 0;
+    let maxInnerHeight = window.innerHeight;
+
+    const apply = () => {
+      raf = 0;
+      if (!mobileMq.matches) {
+        return;
+      }
+      // innerHeight 明显小于历史最大值 = 键盘已让浏览器原生压缩布局视口。
+      // 打上标记，供 useAndroidCaretKeyboardLift 关闭手动抬升，避免双重补偿产生中间空白。
+      maxInnerHeight = Math.max(maxInnerHeight, window.innerHeight);
+      if (window.innerHeight < maxInnerHeight - 80) {
+        root.dataset.nativeKbResize = "1";
+      } else {
+        delete root.dataset.nativeKbResize;
+      }
+      // 手机壳有 -status-bar-drop 的负 margin-top，高度补上这段才能让底栏贴住视口底/键盘顶
+      const wrap = document.querySelector<HTMLElement>(".phone-shell-wrap");
+      const drop = wrap ? (parseFloat(getComputedStyle(wrap).getPropertyValue("--status-bar-drop")) || 0) : 0;
+      const compatibilityScale = Math.max(0.5, Number.parseFloat(root.style.getPropertyValue("--compat-layout-scale")) || 1);
+      const compatibility = loadDeviceCompatibilitySettings();
+      const keyboardResized = window.innerHeight < maxInnerHeight - 80;
+      if (!keyboardResized && compatibility.layoutMode === "manual" && compatibility.screenHeight >= 200) {
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        const referenceHeight = compatibility.screenUnit === "physical" ? compatibility.screenHeight / dpr : compatibility.screenHeight;
+        root.style.setProperty("--phone-screen-height", `${Math.round(referenceHeight / Math.max(0.75, compatibility.uiScale || 1) + drop / compatibilityScale)}px`);
+      } else {
+        root.style.setProperty("--phone-screen-height", `${Math.round((window.innerHeight + drop) / compatibilityScale)}px`);
+      }
+    };
+
+    const requestApply = () => {
+      if (raf) window.cancelAnimationFrame(raf);
+      raf = window.requestAnimationFrame(apply);
+    };
+
+    const handleOrientationChange = () => {
+      // 旋转屏幕时 innerHeight 基线会整体变化，重置后再按新方向判断
+      maxInnerHeight = window.innerHeight;
+      requestApply();
+    };
+
+    apply();
+    window.addEventListener("resize", requestApply);
+    window.addEventListener("orientationchange", handleOrientationChange);
+    // 用户在设置里调整状态栏上移量（写入 wrap 的 --status-bar-drop）时也要重算
+    const observer = new MutationObserver(requestApply);
+    const wrap = document.querySelector<HTMLElement>(".phone-shell-wrap");
+    if (wrap) {
+      observer.observe(wrap, { attributes: true, attributeFilter: ["style"] });
+    }
+
+    return () => {
+      if (raf) window.cancelAnimationFrame(raf);
+      window.removeEventListener("resize", requestApply);
+      window.removeEventListener("orientationchange", handleOrientationChange);
+      observer.disconnect();
+      delete root.dataset.nativeKbResize;
+      root.style.removeProperty("--phone-screen-height");
     };
   }, []);
 }
@@ -1048,6 +1199,7 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     musicOverlayControllerRef.current = controller;
   }, []);
   useAndroidCaretKeyboardLift();
+  useAndroidNativeKeyboardViewport();
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
   const [layout, setLayout] = useState<DesktopLayout>(DEFAULT_LAYOUT);
   // Dock is an ordered icon-id list (max DOCK_MAX), kept disjoint from `layout`.
@@ -1062,6 +1214,7 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
   const [glassPaintPass, setGlassPaintPass] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [activeApp, setActiveApp] = useState<DesktopIconId | null>(null);
+  const [lifeFocusCharacterId, setLifeFocusCharacterId] = useState<string | null>(null);
   const [customApps, setCustomApps] = useState<InstalledCustomApp[]>([]);
   // 自定义 APP 桌面图标样式偏好（global = 忽略上传图标走全局效果）
   const [customAppIconStyles, setCustomAppIconStyles] = useState<Record<string, CustomAppIconStyle>>({});
@@ -1075,6 +1228,7 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
   const [customAppUpdateBusy, setCustomAppUpdateBusy] = useState(false);
   const customAppUpdateCheckingRef = useRef<Set<string>>(new Set());
   const activeAppRef = useRef<DesktopIconId | null>(null);
+  const swipeBackGestureRef = useRef<{ pointerId: number; startX: number; startY: number; edge: "left" | "right"; horizontal: boolean } | null>(null);
   const [customAppBadges, setCustomAppBadges] = useState<Record<string, number>>({});
   const [customAppBackgroundRuns, setCustomAppBackgroundRuns] = useState<CustomAppBackgroundEventRun[]>([]);
   const [customAppBackgroundToolRuns, setCustomAppBackgroundToolRuns] = useState<CustomAppBackgroundToolRun[]>([]);
@@ -1491,11 +1645,12 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
         try {
           const normalized = normalizeLayout(JSON.parse(rawV2), hydratedWidgets, dockIds, hydratedFolders);
           const sane = sanitizeDesktopFolders(hydratedFolders, normalized, hydratedDock, hydratedWidgets);
+          const migratedLayout = migrateNewLifestyleAppsToPageFour(sane.layout, hydratedWidgets, hydratedDock, sane.folders);
           setFolders(sane.folders);
-          setLayout(sane.layout);
-          if (sane.changed) {
-            writeDesktopFolders(sane.folders);
-            kvSet(ICON_LAYOUT_STORAGE_KEY, JSON.stringify(sane.layout));
+          setLayout(migratedLayout);
+          if (sane.changed) writeDesktopFolders(sane.folders);
+          if (sane.changed || migratedLayout !== sane.layout || migratedLayout !== migratedLayout || kvGet(NEW_LIFESTYLE_APPS_PAGE_MIGRATION_KEY) === "1") {
+            kvSet(ICON_LAYOUT_STORAGE_KEY, JSON.stringify(migratedLayout));
           }
           setDesktopReady(true);
           return;
@@ -1776,6 +1931,7 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     let cancelled = false;
     let servicesStarted = false;
     let cleanupWeixinCloudRealtimeSync: (() => void) | null = null;
+    let cleanupLifeScheduleScheduler: (() => void) | null = null;
 
     void (async () => {
       try {
@@ -1812,6 +1968,8 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
       if (cancelled) return;
       startFollowUpService();
       startMomentsService();
+      const stopLifeScheduleScheduler = installLifeScheduleProactiveScheduler();
+      cleanupLifeScheduleScheduler = stopLifeScheduleScheduler;
       startDiaryEntryTimerService();
       const stopWeixinCloudRealtimeSync = startWeixinCloudRealtimeSync();
       servicesStarted = true;
@@ -1830,6 +1988,8 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
       if (servicesStarted) {
         stopFollowUpService();
         stopMomentsService();
+        cleanupLifeScheduleScheduler?.();
+        cleanupLifeScheduleScheduler = null;
         stopDiaryEntryTimerService();
       }
       bgTimerCleanup();
@@ -2381,6 +2541,30 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
   // Allow other components to switch apps via custom event
   const [chatInitSessionId, setChatInitSessionId] = useState<string | null>(null);
   const [activeChatSession, setActiveChatSession] = useState<ChatSession | null>(null);
+  useEffect(() => {
+    const handleNativeBack = (event: Event) => {
+      const custom = event as CustomEvent<{ handled?: boolean }>;
+      if (activeApp !== null) {
+        const appBack = { handled: false };
+        window.dispatchEvent(new CustomEvent("floatphone-app-back", { detail: appBack }));
+        if (appBack.handled) {
+          if (custom.detail) custom.detail.handled = true;
+          return;
+        }
+        if (custom.detail) custom.detail.handled = true;
+        setActiveApp(null);
+        setActiveChatSession(null);
+        setOpenFolderId(null);
+        return;
+      }
+      if (openFolderId !== null) {
+        if (custom.detail) custom.detail.handled = true;
+        setOpenFolderId(null);
+      }
+    };
+    window.addEventListener("floatphone-native-back", handleNativeBack);
+    return () => window.removeEventListener("floatphone-native-back", handleNativeBack);
+  }, [activeApp, openFolderId]);
   const [customAppLaunchContext, setCustomAppLaunchContext] = useState<CustomAppLaunchState | null>(null);
   const [appMarketLaunchContext, setAppMarketLaunchContext] = useState<Record<string, unknown> | null>(null);
   useEffect(() => {
@@ -2407,6 +2591,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
           }
           : null);
         setAppMarketLaunchContext(nextAppId === "appmarket" ? launchContextRecord : null);
+        setLifeFocusCharacterId(nextAppId === "life" && typeof detail.characterId === "string" ? detail.characterId : null);
         if (detail.appId === "resources") {
           setResourcesInitialPage(detail.resourcePage === "vn_assets" || detail.resourcePage === "memory" ? detail.resourcePage : "main");
         }
@@ -2464,6 +2649,42 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
     }, 0);
   }, []);
 
+  // 离线推送通知点击 → 壳把 App 拉起并写入 #open-chat=<sessionId> 深链。
+  // 冷启动时 hash 首帧就在，但要等聊天数据水合完（desktopReady）再开，
+  // 否则找不到会话会静默放弃；App 已在运行时壳只改 hash，走 hashchange 热启动。
+  useEffect(() => {
+    if (!desktopReady) return;
+    const consumeOpenChatHash = () => {
+      const match = window.location.hash.match(/open-chat=([^&]+)/);
+      if (!match) return;
+      const url = new URL(window.location.href);
+      // 只清 hash，保留 query（可能有来电的 ring 参数在同一路径上）
+      window.history.replaceState(null, "", url.pathname + url.search);
+      const sessionId = decodeURIComponent(match[1]);
+      if (sessionId) openChatSessionFromNotice(sessionId);
+    };
+    const bootTimer = window.setTimeout(consumeOpenChatHash, 1200);
+    window.addEventListener("hashchange", consumeOpenChatHash);
+    return () => {
+      window.clearTimeout(bootTimer);
+      window.removeEventListener("hashchange", consumeOpenChatHash);
+    };
+  }, [desktopReady, openChatSessionFromNotice]);
+
+  // 通话挂断后让角色回应一次。
+  // 通话屏已提升到全局层，挂断时聊天页可能根本没挂载（用户在桌面/别的 App 里），
+  // 所以收尾放在常驻的桌面壳里；requestBackgroundChatReply 自身会处理
+  //「聊天页正开着时由聊天页生成」的情况，不会重复两套内容。
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const sessionId = (e as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+      if (!sessionId) return;
+      window.setTimeout(() => { void requestBackgroundChatReply(sessionId, { channel: "call_end" }); }, 0);
+    };
+    window.addEventListener("chat-call-ended", handler);
+    return () => window.removeEventListener("chat-call-ended", handler);
+  }, []);
+
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<{
@@ -2475,13 +2696,8 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
       if (!detail || detail.replayed) return;
 
       const sessions = loadChatSessions();
-      const scope = loadChatScope();
       const sessionId = detail.sessionId
-        || sessions.find(session => (
-          !session.isGroup
-          && session.contactId === detail.characterId
-          && sessionMatchesChatScope(session, scope)
-        ))?.id
+        || sessions.find(session => !session.isGroup && session.contactId === detail.characterId)?.id
         || "";
       if (!sessionId) return;
 
@@ -2564,6 +2780,15 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
       const title = detailSenderName && detailSenderName !== "对方"
         ? detailSenderName
         : (isGroup ? session.groupName || "群聊" : session.alias || char?.name || "新消息");
+
+      // 壳环境：站内横幅整体停用，改发原生系统通知（标题/头像沿用上面的解析结果）。
+      // 放在这里是因为「正在看这个会话就不打扰」的判断刚做完——用户要的正是
+      // 「除当前聊天页外全线弹系统通知」，过滤逻辑与横幅共用同一处。
+      if (canSendShellNotification()) {
+        // 第 4 个参数带会话 id：壳点通知时据此直达该会话；旧壳会忽略多余参数。
+        sendShellNotification(title, detail.body.trim(), detail.avatar ?? char?.avatar ?? null, detail.sessionId);
+        return;
+      }
 
       if (chatMessageNoticeTimerRef.current !== null) {
         window.clearTimeout(chatMessageNoticeTimerRef.current);
@@ -3875,6 +4100,43 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
     if (targetPageIndex !== page) setCurrentPageIndex(targetPageIndex);
   }, [editMode, getSwipePageWidth, pageCount, setSwipeDrag]);
 
+  // A canceled pointer (including rotation/OS gesture takeover) must not be treated
+  // as a completed swipe. Clear the transient translate so the desktop cannot get stuck.
+  const handleSwipeCancel = useCallback((e: React.PointerEvent) => {
+    const drag = editDragRef.current;
+    if (drag && drag.pointerId === e.pointerId) {
+      handleSwipeEnd(e);
+      return;
+    }
+    if (swipeRef.current.pointerId === e.pointerId) {
+      swipeRef.current.pointerId = null;
+      swipeRef.current.deltaX = 0;
+      swipeRef.current.locked = null;
+      setSwipeDrag(0);
+    }
+    cancelLongPress();
+    swipeLayerRef.current?.classList.remove("phone-swipe-dragging");
+  }, [handleSwipeEnd, setSwipeDrag]);
+
+  // Android may emit resize/orientationchange while a pointer is captured. Reset stale
+  // gesture state so the next horizontal swipe starts cleanly after returning upright.
+  useEffect(() => {
+    const resetSwipeAfterRotation = () => {
+      if (editDragRef.current?.active) return;
+      swipeRef.current.pointerId = null;
+      swipeRef.current.deltaX = 0;
+      swipeRef.current.locked = null;
+      setSwipeDrag(0);
+      swipeLayerRef.current?.classList.remove("phone-swipe-dragging");
+    };
+    window.addEventListener("orientationchange", resetSwipeAfterRotation);
+    window.addEventListener("resize", resetSwipeAfterRotation);
+    return () => {
+      window.removeEventListener("orientationchange", resetSwipeAfterRotation);
+      window.removeEventListener("resize", resetSwipeAfterRotation);
+    };
+  }, [setSwipeDrag]);
+
   const handleCloseXiaohongshu = useCallback((isBusy?: boolean) => {
     const shouldKeepMounted = isBusy ?? xiaohongshuBusy;
     setActiveApp(null);
@@ -3897,6 +4159,20 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
     setShoppingMounted(false);
   }, [shoppingBusy]);
 
+  /** 内置「通话统计」：1:1 复用 call.stats 2.1.0 的 HTML，由 CustomAppRunner 挂载。 */
+  const CALL_STATS_BUILTIN_APP: InstalledCustomApp = {
+    id: "callstats-builtin",
+    name: "通话统计",
+    version: "2.1.0",
+    description: "通话中心：时长统计与图表、日历视图、逐通回看完整对话、角色语音复听、通话总结。数据全部来自本机聊天记录，不上传。",
+    entryHtml: CALL_STATS_ENTRY_HTML,
+    permissions: ["chat.read", "characters.read", "ai.generate", "app.data.read", "app.data.write", "ui.toast", "voice.tts"] as InstalledCustomApp["permissions"],
+    manifest: { id: "call.stats", name: "通话统计", version: "2.1.0", sdkVersion: "1.0", entry: "index.html", permissions: ["chat.read", "characters.read", "ai.generate", "app.data.read", "app.data.write", "ui.toast", "voice.tts"] },
+    assets: {},
+    installedAt: "2026-10-24T00:00:00.000Z",
+    updatedAt: "2026-10-24T00:00:00.000Z",
+  };
+
   function closeCustomAppRunner(app: InstalledCustomApp): void {
     const launchState = customAppLaunchContext?.appId === app.id ? customAppLaunchContext : null;
     setCustomAppLaunchContext(null);
@@ -3913,6 +4189,95 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
     }
     setActiveApp(null);
   }
+
+  // Android-style system back gesture for every foreground app. Nested pages can
+  // consume "phone-swipe-back" first (e.g. the workshop's GitHub settings sheet);
+  // otherwise the active app is closed/returned using the same app-specific path
+  // as its close button.
+  useEffect(() => {
+    const cancelGesture = () => { swipeBackGestureRef.current = null; };
+    const isGestureExcluded = (target: EventTarget | null) => {
+      if (!(target instanceof Element)) return false;
+      return Boolean(target.closest(
+        'input, textarea, select, [contenteditable="true"], video, audio, canvas, [data-swipe-back-ignore], .watch-player, .chat-gallery-preview, .chat-photo-carousel-stack, .photo-wall-surface, [data-photo-wall-viewport]'
+      ));
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.pointerType !== "touch" || !event.isPrimary || event.button !== 0) return;
+      const edge: "left" | "right" | null = event.clientX <= 24
+        ? "left"
+        : event.clientX >= window.innerWidth - 24
+          ? "right"
+          : null;
+      if (!activeAppRef.current || !edge || isGestureExcluded(event.target)) {
+        swipeBackGestureRef.current = null;
+        return;
+      }
+      swipeBackGestureRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        edge,
+        horizontal: false,
+      };
+    };
+    const onPointerMove = (event: PointerEvent) => {
+      const gesture = swipeBackGestureRef.current;
+      if (!gesture || gesture.pointerId !== event.pointerId) return;
+      const dx = event.clientX - gesture.startX;
+      const dy = event.clientY - gesture.startY;
+      const towardCenter = gesture.edge === "left" ? dx : -dx;
+      if (!gesture.horizontal) {
+        if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+        if (Math.abs(dy) > Math.abs(dx) * 1.15 || towardCenter <= 0) {
+          cancelGesture();
+          return;
+        }
+        gesture.horizontal = true;
+      }
+      if (towardCenter > 12 && event.cancelable) event.preventDefault();
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      const gesture = swipeBackGestureRef.current;
+      if (!gesture || gesture.pointerId !== event.pointerId) return;
+      swipeBackGestureRef.current = null;
+      const dx = event.clientX - gesture.startX;
+      const dy = event.clientY - gesture.startY;
+      const towardCenter = gesture.edge === "left" ? dx : -dx;
+      if (!gesture.horizontal || towardCenter < Math.max(76, window.innerWidth * 0.18) || towardCenter < Math.abs(dy) * 1.35) return;
+      const currentApp = activeAppRef.current;
+      if (!currentApp) return;
+      const backEvent = new Event("phone-swipe-back", { cancelable: true });
+      document.dispatchEvent(backEvent);
+      if (backEvent.defaultPrevented) return;
+      const customApp = getCustomAppForIcon(currentApp);
+      if (customApp) {
+        closeCustomAppRunner(customApp);
+        return;
+      }
+      if (currentApp === "chat") {
+        setActiveChatSession(null);
+        setChatInitSessionId(null);
+      }
+      setActiveApp(null);
+    };
+    const onPointerCancel = (event: PointerEvent) => {
+      if (swipeBackGestureRef.current?.pointerId === event.pointerId) cancelGesture();
+    };
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("pointermove", onPointerMove, { capture: true, passive: false });
+    window.addEventListener("pointerup", onPointerUp, true);
+    window.addEventListener("pointercancel", onPointerCancel, true);
+    window.addEventListener("blur", cancelGesture);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("pointermove", onPointerMove, true);
+      window.removeEventListener("pointerup", onPointerUp, true);
+      window.removeEventListener("pointercancel", onPointerCancel, true);
+      window.removeEventListener("blur", cancelGesture);
+      cancelGesture();
+    };
+  }, [getCustomAppForIcon, customAppLaunchContext]);
 
   function dismissPendingCustomAppUpdate(): void {
     if (customAppUpdateBusy || !customAppUpdatePrompt) return;
@@ -4001,10 +4366,6 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
       );
     }
 
-    if (activeApp === "favorites") {
-      return <FavoritesApp onClose={() => setActiveApp(null)} />;
-    }
-
     if (activeApp === "theme") {
       return (
         <PhoneThemeApp
@@ -4059,7 +4420,32 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
       return <PhoneCalendarApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
     }
     if (activeApp === "realitybridge") {
-      return <RealityBridgeApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
+      return (
+        <RealityBridgeApp
+          onClose={() => setActiveApp(null)}
+          onNotice={setNotice}
+          onOpenSettings={(page) => {
+            // 跳到设置里的某个子页。这里必须**两条腿一起跑**，只靠一条会漏：
+            //
+            //  ① sessionStorage 标记 —— 只有设置页处于「重新挂载」状态时才会被
+            //     读到。它是给「设置页此刻没开着」这种正常情况用的。
+            //  ② settings-navigate 事件 —— 设置页常驻监听，**不依赖挂载时机**。
+            //
+            // 之前只用了 ①，于是出现「跳转了但停在设置主菜单」：设置页的读取
+            // effect 只在挂载时跑一次，实例若被复用、或那次读取没赶上，标记就白写了。
+            // ②补上后，无论设置页是刚挂载还是早就在，这一页都切得过去。
+            //
+            // 顺序要紧：先关掉当前 App，再开设置——否则设置页会被现实桥盖住。
+            try { sessionStorage.setItem("mascot-settings-mode", page); } catch { /* 隐私模式等，忽略 */ }
+            setActiveApp("settings");
+            // 等设置页挂载完成再把事件送过去。180ms 足够它渲染并装上监听器；
+            // 早于此事件没人接，晚了用户已经看到主菜单、会有「闪一下才跳」的观感。
+            window.setTimeout(() => {
+              window.dispatchEvent(new CustomEvent("settings-navigate", { detail: { page } }));
+            }, 180);
+          }}
+        />
+      );
     }
     if (activeApp === "qa") {
       return (
@@ -4082,6 +4468,41 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
 
     if (activeApp === "story") {
       return <StoryApp onClose={() => setActiveApp(null)} />;
+    }
+
+    if (activeApp === "life") {
+      return <LifeEngineApp onClose={() => setActiveApp(null)} initialCharacterId={lifeFocusCharacterId ?? undefined} />;
+    }
+
+    if (activeApp === "archive") {
+      return <ArchiveRoomApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
+    }
+
+    if (activeApp === "photowall") {
+      return <PhotoWallApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
+    }
+
+    if (activeApp === "watchtogether") {
+      return <WatchTogetherApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
+    }
+
+    if (activeApp === "callstats") {
+      return (
+        <CustomAppForegroundBoundary
+          key={CALL_STATS_BUILTIN_APP.id}
+          appName={CALL_STATS_BUILTIN_APP.name}
+          appId={CALL_STATS_BUILTIN_APP.id}
+          appVersion={CALL_STATS_BUILTIN_APP.version}
+          manifestId={CALL_STATS_BUILTIN_APP.manifest?.id}
+          onClose={() => setActiveApp(null)}
+        >
+          <CustomAppRunner
+            app={CALL_STATS_BUILTIN_APP}
+            onClose={() => setActiveApp(null)}
+            onNotice={setNotice}
+          />
+        </CustomAppForegroundBoundary>
+      );
     }
 
     if (activeApp === "vnmode") {
@@ -4490,7 +4911,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
                 onPointerDown={handleSwipeStart}
                 onPointerMove={handleSwipeMove}
                 onPointerUp={handleSwipeEnd}
-                onPointerCancel={handleSwipeEnd}
+                onPointerCancel={handleSwipeCancel}
               >
                 {/* Edit mode Done button */}
                 {editMode && !activeApp && (
@@ -4587,15 +5008,24 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
                                       justifySelf: "start",
                                       alignSelf: "start",
                                       marginLeft: "var(--slot-icon-offset-x)",
+                                      position: "relative",
                                     }}
-                                  />
+                                  >
+                                    <span className="drop-position-label" style={{ position: "absolute", zIndex: 3, top: 2, left: 2, padding: "2px 5px", borderRadius: 6, background: "var(--c-accent, #8b5cf6)", color: "#fff", fontSize: 9, lineHeight: 1.3, whiteSpace: "nowrap", pointerEvents: "none" }}>
+                                      第{dropTarget.row}行 · 第{dropTarget.col}列
+                                    </span>
+                                  </div>
                                 );
                               }
                               return (
                                 <div
                                   className="drop-indicator"
-                                  style={{ gridRow: dropTarget.row, gridColumn: dropTarget.col }}
-                                />
+                                  style={{ gridRow: dropTarget.row, gridColumn: dropTarget.col, position: "relative" }}
+                                >
+                                  <span className="drop-position-label" style={{ position: "absolute", zIndex: 3, top: 2, left: 2, padding: "2px 5px", borderRadius: 6, background: "var(--c-accent, #8b5cf6)", color: "#fff", fontSize: 9, lineHeight: 1.3, whiteSpace: "nowrap", pointerEvents: "none" }}>
+                                    第{dropTarget.row}行 · 第{dropTarget.col}列
+                                  </span>
+                                </div>
                               );
                             })()}
 
@@ -4773,7 +5203,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
                   style={{ "--dock-count": Math.max(1, dock.length) } as CSSProperties}
                   onPointerMove={handleSwipeMove}
                   onPointerUp={handleSwipeEnd}
-                  onPointerCancel={handleSwipeEnd}
+                  onPointerCancel={handleSwipeCancel}
                 >
                   {dockSkinUrl && (
                     <span className="dock-skin-layer" style={{ backgroundImage: `url("${dockSkinUrl}")` }} />
@@ -4840,6 +5270,9 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
               <MascotFloat />
               {/* 预览弹窗宿主：独立于桌宠的展开/收起状态，否则桌宠收成小球时弹不出来 */}
               <MascotPreviewHost />
+
+              {/* 全局通话层：常驻桌面壳，切会话 / 回桌面 / 开别的 App 都不中断通话 */}
+              <CallLayer />
 
               {/* Widget Picker Bottom Sheet */}
               {showWidgetPicker && (
@@ -5058,6 +5491,8 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
           </div>
         </div>
       </section>
+      {/* 感知引擎：挂载即开始采样，卸载即停止。非壳环境自动空转 */}
+      <PerceptionBootstrap />
       {/* 微信云同步过程可视化：拉取/上传/运行包同步与失败都在这里冒 toast */}
       <WeixinSyncToast />
     </>

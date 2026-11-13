@@ -21,7 +21,6 @@ import {
   type MediaResolver,
 } from "./serializers";
 import { kvEntries, kvGet, kvRemove, kvSetAsync } from "../kv-db";
-import { isFavoriteBackupItem } from "../favorites-transfer";
 
 type SourceStats = {
   records: number;
@@ -232,9 +231,6 @@ function recordTimeMs(value: Record<string, unknown>): number | null {
 
 type ImageRangeResult = { skip: boolean; value: unknown };
 
-/** Runs after the read transaction ends; undefined skips a record. */
-export type ExportRecordTransform = (value: unknown, storeName: string) => Promise<unknown>;
-
 /**
  * Build a backup-only copy with old dynamic images removed.
  * Text, messages, posts and comments remain intact; the live IndexedDB record is never mutated.
@@ -291,7 +287,6 @@ async function exportIndexedDbSource(
   collector?: MediaCollector,
   excludeMedia = false,
   imageCutoffMs?: number,
-  transform?: ExportRecordTransform,
 ): Promise<IndexedDbSourceBackup> {
   const db = await openDb(source.dbName);
   if (!db) {
@@ -344,11 +339,9 @@ async function exportIndexedDbSource(
         rawRecords[index] = undefined as unknown as StoreRecordBackup;
         const filtered = filterOldDynamicImages(source.dbName, storeName, record.value, imageCutoffMs);
         if (filtered.skip) continue;
-        const value = transform ? await transform(filtered.value, storeName) : filtered.value;
-        if (value === undefined) continue;
         records.push({
           key: await serializeValue(record.key),
-          value: await serializeValue(value, collector, { excludeMedia }),
+          value: await serializeValue(filtered.value, collector, { excludeMedia }),
         });
       }
 
@@ -433,9 +426,8 @@ export async function exportSource(
   collector?: MediaCollector,
   excludeMedia = false,
   imageCutoffMs?: number,
-  transform?: ExportRecordTransform,
 ): Promise<SourceBackup> {
-  if (source.type === "indexeddb") return exportIndexedDbSource(source, collector, excludeMedia, imageCutoffMs, transform);
+  if (source.type === "indexeddb") return exportIndexedDbSource(source, collector, excludeMedia, imageCutoffMs);
   if (source.type === "kv") return exportKvSource(source, collector);
   return exportLocalStorageSource(source, collector);
 }
@@ -689,9 +681,6 @@ export async function importSource(
           const record = storePayload.records[recordIndex];
           const key = await deserializeValue(record.key);
           const value = await deserializeValue(record.value, resolver);
-          if (payload.dbName === "AiPhoneFavoritesDB" && (storePayload.name !== "items" || !isFavoriteBackupItem(value) || (key !== undefined && key !== value.id))) {
-            throw new Error("收藏记录格式损坏");
-          }
           const hasKey = key !== undefined && key !== null;
           const transaction = db.transaction(storePayload.name, "readwrite");
           done = transactionDone(transaction);

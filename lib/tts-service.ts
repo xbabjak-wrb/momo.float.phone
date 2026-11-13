@@ -12,16 +12,10 @@ export type VoiceApiConfigResolved = VoiceApiConfig;
 export function resolveVoiceConfig(characterId: string, appId?: ContentAppId): VoiceApiConfig | null {
     const bindings = loadBindingConfig();
     const slot = resolveBinding(bindings, characterId, appId ?? "chat");
-    const configs = loadVoiceConfigs();
-    if (slot.voiceConfigId) {
-        const bound = configs.find(c => c.id === slot.voiceConfigId);
-        return bound?.enableTTS === false ? null : bound || null;
-    }
+    if (!slot.voiceConfigId) return null;
 
-    // 只有一个启用的方案时自动兜底，避免“设置页试听成功、聊天却提示未绑定”。
-    // 多个方案仍要求用户显式绑定，防止角色误用其他人的音色。
-    const enabledConfigs = configs.filter(config => config.enableTTS !== false);
-    return enabledConfigs.length === 1 ? enabledConfigs[0] : null;
+    const configs = loadVoiceConfigs();
+    return configs.find(c => c.id === slot.voiceConfigId) || null;
 }
 
 /**
@@ -31,7 +25,6 @@ export function resolveVoiceConfig(characterId: string, appId?: ContentAppId): V
  * Supported providers:
  * - Minimax: REST API → hex-encoded mp3
  * - OpenAI: REST API → binary audio blob
- * - FishAudio / ElevenLabs: proxied REST API → binary audio blob
  */
 export async function synthesizeSpeech(
     text: string,
@@ -50,34 +43,7 @@ export async function synthesizeSpeech(
         return synthesizeOpenAI(text, voiceConfig);
     }
 
-    if (provider === "FishAudio" || provider === "ElevenLabs") {
-        return synthesizeExternalVoice(text, voiceConfig);
-    }
-
     return null;
-}
-
-async function synthesizeExternalVoice(text: string, config: VoiceApiConfig): Promise<Blob | null> {
-    if (!config.apiKey) throw new Error(`${config.provider} API Key 未配置`);
-    if (!config.defaultVoice.trim()) throw new Error(`${config.provider} Voice ID 未配置`);
-    const response = await fetchWithTimeout("/api/voice/synthesize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-            provider: config.provider,
-            apiKey: config.apiKey,
-            text,
-            voiceId: config.defaultVoice,
-            model: config.model,
-            speechSpeed: config.speechSpeed,
-        }),
-    });
-    if (!response.ok) {
-        const data = await response.json().catch(() => ({})) as { message?: string; error?: string };
-        throw new Error(data.message || data.error || `${config.provider} API 请求失败 (${response.status})`);
-    }
-    const blob = await response.blob();
-    return new Blob([await blob.arrayBuffer()], { type: response.headers.get("content-type") || "audio/mpeg" });
 }
 
 // A stalled TTS request (TCP connected but no response — cold start, rate-limit
@@ -220,6 +186,8 @@ async function synthesizeOpenAI(text: string, config: VoiceApiConfig): Promise<B
 // audio session back to the microphone. A shared <audio> element is kept as a
 // fallback for browsers without AudioContext.
 
+type AudioContextWindow = typeof globalThis & { webkitAudioContext?: typeof AudioContext };
+
 let _audioCtx: AudioContext | null = null;
 let _sharedAudio: HTMLAudioElement | null = null;
 let _audioUnlocked = false;
@@ -268,7 +236,8 @@ export function setCallAudioSessionActive(active: boolean): void {
 
 function getAudioContext(): AudioContext | null {
     if (typeof window === "undefined") return null;
-    const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
+    const audioWindow = window as unknown as AudioContextWindow;
+    const Ctor = audioWindow.AudioContext || audioWindow.webkitAudioContext;
     if (!Ctor) return null;
     if (!_audioCtx) {
         // 不要钉 sampleRate:部分 iOS 版本上非硬件采样率的 ctx 会"时钟照走、
@@ -398,19 +367,41 @@ function playAudioBlobElement(blob: Blob): { promise: Promise<void>; abort: () =
 
     let settled = false;
     let resolveFn: () => void = () => {};
+    let guardTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearGuard = () => {
+        if (guardTimer !== null) { clearTimeout(guardTimer); guardTimer = null; }
+    };
     const finalize = () => {
         if (settled) return;
         settled = true;
+        clearGuard();
         audio.onended = null;
         audio.onerror = null;
+        audio.onpause = null;
+        audio.onloadedmetadata = null;
         URL.revokeObjectURL(url);
         try { audio.pause(); audio.removeAttribute("src"); audio.load(); } catch {}
         resolveFn();
+    };
+    // 播放被别的 App（如后台刷视频）抢走音频焦点时，浏览器只会发一个 pause，
+    // ended 永远不会来——await promise 就此挂死，调用方状态机卡在「对方正在说话」，
+    // 排队的消息再也等不到 IDLE。把这种「非我们主动的暂停」当作播放结束。
+    const onPause = () => { if (!settled) finalize(); };
+    // 兜底闸门：万一连 pause 都不发（play() 悬着、缓冲卡死），也要让 promise 落定。
+    // 音频时长已知就按它放宽，未知给一个固定上限。
+    const armGuard = () => {
+        clearGuard();
+        const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+        const capMs = duration > 0 ? (duration * 2 + 15) * 1000 : 180_000;
+        guardTimer = setTimeout(() => { if (!settled) finalize(); }, capMs);
     };
     const promise = new Promise<void>((resolve) => {
         resolveFn = resolve;
         audio.onended = finalize;
         audio.onerror = finalize;
+        audio.onpause = onPause;
+        audio.onloadedmetadata = armGuard;
+        armGuard();
         audio.play().catch(() => {
             finalize();
         });

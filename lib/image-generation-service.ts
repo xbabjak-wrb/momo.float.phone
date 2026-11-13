@@ -1,15 +1,11 @@
 import type { ImageGenerationSettings, NovelAiPreset } from "./settings-types";
-import { loadBindingConfig, loadImageGenerationSettings, loadUserIdentities, resolveBinding, DEFAULT_NOVELAI_PRESET } from "./settings-storage";
+import { loadBindingConfig, loadImageGenerationSettings, resolveBinding, DEFAULT_NOVELAI_PRESET } from "./settings-storage";
 import { applyImageGenerationBinding } from "./image-generation-binding";
-import { loadChatScope } from "./chat-scope-storage";
 import JSZip from "jszip";
 import { getChatImageFromIndexedDB } from "./chat-asset-storage";
+import { loadCharacters } from "./character-storage";
 import { storeMediaBlob } from "./media-cache-storage";
 import { throwIfAborted } from "./abort-utils";
-import { kvGet, kvSet, registerKvMigration } from "./kv-db";
-import { sha256TextHex } from "./sha256-stream";
-import { faceCropPixels, type FaceCrop } from "./face-crop";
-import { descriptionNeedsUserReference } from "./image-reference-selection";
 import {
   NOVELAI_COMMON_MODELS,
   getNovelAiResolution,
@@ -27,6 +23,9 @@ export type ImageGenerationResult = {
   mimeType: string;
   prompt: string;
   usedReferenceImage: boolean;
+  /** Actual identity-reference images passed to the provider after loading/collage/limits. */
+  referenceImageCount?: number;
+  referenceImageLabels?: string[];
   revisedPrompt?: string;
 };
 
@@ -39,60 +38,6 @@ type ImageGenerationApiResponse = {
   mimeType?: string;
   revisedPrompt?: string;
 };
-
-const PENDING_IMAGE_RESULTS_KEY = "ai_phone_pending_image_results_v1";
-registerKvMigration(PENDING_IMAGE_RESULTS_KEY);
-type PendingImageResult = { url: string; revisedPrompt?: string };
-const pendingImageResults = new Map<string, PendingImageResult>();
-
-async function imageResultKey(params: { settings: ImageGenerationSettings; prompt: string; referenceImageDataUrl: string | null }): Promise<string> {
-  // Only the digest is persisted; credentials and reference pictures are never stored here.
-  const { settings, prompt, referenceImageDataUrl } = params;
-  const input = JSON.stringify([settings.baseUrl, settings.apiKey, settings.model, settings.size, settings.quality, prompt, referenceImageDataUrl]);
-  if (!globalThis.crypto?.subtle) return sha256TextHex(input);
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
-  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function pendingResult(key: string): PendingImageResult | undefined {
-  if (pendingImageResults.has(key)) return pendingImageResults.get(key);
-  try {
-    const saved = JSON.parse(kvGet(PENDING_IMAGE_RESULTS_KEY) || "{}") as Record<string, PendingImageResult>;
-    return saved[key];
-  } catch { return undefined; }
-}
-
-function savePendingResult(key: string, result?: PendingImageResult): void {
-  if (result) pendingImageResults.set(key, result);
-  else pendingImageResults.delete(key);
-  try {
-    const saved = JSON.parse(kvGet(PENDING_IMAGE_RESULTS_KEY) || "{}") as Record<string, PendingImageResult>;
-    if (result) saved[key] = result;
-    else delete saved[key];
-    kvSet(PENDING_IMAGE_RESULTS_KEY, JSON.stringify(saved));
-  } catch { /* Keep the in-memory copy if local persistence is unavailable. */ }
-}
-
-async function recoverImageResult(key: string, result: PendingImageResult, signal?: AbortSignal): Promise<ImageGenerationApiResponse> {
-  savePendingResult(key, result);
-  const controller = new AbortController();
-  const onAbort = () => controller.abort();
-  signal?.addEventListener("abort", onAbort, { once: true });
-  const timer = setTimeout(onAbort, 60_000);
-  try {
-    throwIfAborted(signal);
-    const downloaded = await fetchImageUrlAsBase64(result.url, controller.signal);
-    savePendingResult(key);
-    return { ...downloaded, revisedPrompt: result.revisedPrompt };
-  } catch (error) {
-    throwIfAborted(signal);
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`图片已生成，但下载失败：${detail}。保持相同配置和提示词重试将只下载原图，不会重新生图；若地址已过期，请先到 API 后台保存原图。`);
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
-  }
-}
 
 const IMAGE_MODEL_HINTS = [
   "image",
@@ -154,9 +99,57 @@ function loadDataUrlImage(dataUrl: string): Promise<HTMLImageElement> {
   });
 }
 
+type ReferenceSource = { label: string; dataUrl: string; crop?: { x: number; y: number; size: number } };
+
+/**
+ * 兼容“只接受一张参考图”的 OpenAI 兼容服务：把本次出镜人物拼成一张带编号的
+ * 身份参考图。多图仍优先；拼图只在用户显式选择时启用。
+ */
+async function buildReferenceCollage(sources: ReferenceSource[]): Promise<{ dataUrl: string; legend: string } | null> {
+  if (typeof document === "undefined" || sources.length < 2) return null;
+  const cell = 512;
+  const labelHeight = 46;
+  const cols = Math.ceil(Math.sqrt(sources.length));
+  const rows = Math.ceil(sources.length / cols);
+  const canvas = document.createElement("canvas");
+  canvas.width = cols * cell;
+  canvas.height = rows * (cell + labelHeight);
+  const context = canvas.getContext("2d");
+  if (!context) return null;
+  context.fillStyle = "#111111";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  const legend: string[] = [];
+  for (let index = 0; index < sources.length; index++) {
+    const source = sources[index];
+    const image = await loadDataUrlImage(source.dataUrl).catch(() => null);
+    if (!image) continue;
+    const col = index % cols;
+    const row = Math.floor(index / cols);
+    const x = col * cell;
+    const y = row * (cell + labelHeight);
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    const crop = source.crop;
+    const sourceSize = crop ? Math.max(1, Math.round(Math.min(width, height) * Math.max(0.18, Math.min(1, crop.size)))) : Math.min(width, height);
+    const sourceX = crop ? Math.round(Math.max(0, Math.min(width - sourceSize, crop.x * width))) : Math.max(0, Math.floor((width - sourceSize) / 2));
+    const sourceY = crop ? Math.round(Math.max(0, Math.min(height - sourceSize, crop.y * height))) : Math.max(0, Math.floor((height - sourceSize) / 2));
+    context.drawImage(image, sourceX, sourceY, sourceSize, sourceSize, x, y, cell, cell);
+    context.fillStyle = "rgba(0,0,0,.72)";
+    context.fillRect(x, y + cell, cell, labelHeight);
+    context.fillStyle = "#ffffff";
+    context.font = "28px sans-serif";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText(`${index + 1}. ${source.label}`, x + cell / 2, y + cell + labelHeight / 2);
+    legend.push(`${index + 1}=${source.label}`);
+  }
+  if (!legend.length) return null;
+  return { dataUrl: canvas.toDataURL("image/png"), legend: legend.join("、") };
+}
+
 async function normalizeReferenceImageForEdit(
   dataUrl: string,
-  crop?: FaceCrop,
+  crop?: { x: number; y: number; size: number },
 ): Promise<string> {
   if (!crop && dataUrlMimeType(dataUrl) === "image/png") return dataUrl;
   if (typeof document === "undefined") return dataUrl;
@@ -168,13 +161,20 @@ async function normalizeReferenceImageForEdit(
     if (!width || !height) return dataUrl;
 
     const canvas = document.createElement("canvas");
-    const region = crop ? faceCropPixels(crop, width, height) : { x: 0, y: 0, width, height };
-    canvas.width = region.width;
-    canvas.height = region.height;
+    const normalizedSize = crop ? Math.max(0.18, Math.min(1, crop.size)) : 1;
+    const sourceSize = Math.max(1, Math.round(Math.min(width, height) * normalizedSize));
+    const sourceX = crop
+      ? Math.round(Math.max(0, Math.min(width - sourceSize, crop.x * width)))
+      : 0;
+    const sourceY = crop
+      ? Math.round(Math.max(0, Math.min(height - sourceSize, crop.y * height)))
+      : 0;
+    canvas.width = crop ? sourceSize : width;
+    canvas.height = crop ? sourceSize : height;
     const context = canvas.getContext("2d");
     if (!context) return dataUrl;
     if (crop) {
-      context.drawImage(image, region.x, region.y, region.width, region.height, 0, 0, region.width, region.height);
+      context.drawImage(image, sourceX, sourceY, sourceSize, sourceSize, 0, 0, sourceSize, sourceSize);
     } else {
       context.drawImage(image, 0, 0, width, height);
     }
@@ -182,64 +182,6 @@ async function normalizeReferenceImageForEdit(
   } catch {
     return dataUrl;
   }
-}
-
-async function combineReferenceImagesForEdit(
-  references: Array<{ dataUrl: string; label: string }>,
-): Promise<string | null> {
-  if (references.length === 0) return null;
-  if (references.length === 1 || typeof document === "undefined") return references[0].dataUrl;
-  try {
-    const items = await Promise.all(references.slice(0, 6).map(async reference => ({
-      ...reference,
-      image: await loadDataUrlImage(reference.dataUrl),
-    })));
-    const columns = Math.min(2, items.length);
-    const rows = Math.ceil(items.length / columns);
-    const cell = 512;
-    const labelHeight = 46;
-    const gap = 12;
-    const canvas = document.createElement("canvas");
-    canvas.width = columns * cell + (columns + 1) * gap;
-    canvas.height = rows * (cell + labelHeight) + (rows + 1) * gap;
-    const context = canvas.getContext("2d");
-    if (!context) return references[0].dataUrl;
-    context.fillStyle = "#f5f5f5";
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    items.forEach((item, index) => {
-      const column = index % columns;
-      const row = Math.floor(index / columns);
-      const x = gap + column * cell;
-      const y = gap + row * (cell + labelHeight);
-      context.fillStyle = "#ffffff";
-      context.fillRect(x, y, cell, cell + labelHeight);
-      const width = item.image.naturalWidth || item.image.width;
-      const height = item.image.naturalHeight || item.image.height;
-      const scale = Math.min(cell / width, cell / height);
-      const drawWidth = width * scale;
-      const drawHeight = height * scale;
-      context.drawImage(item.image, x + (cell - drawWidth) / 2, y + (cell - drawHeight) / 2, drawWidth, drawHeight);
-      context.fillStyle = "#111111";
-      context.font = "600 24px sans-serif";
-      context.textAlign = "center";
-      context.textBaseline = "middle";
-      context.fillText(item.label, x + cell / 2, y + cell + labelHeight / 2, cell - 24);
-    });
-    return canvas.toDataURL("image/png");
-  } catch {
-    return references[0].dataUrl;
-  }
-}
-
-function resolveGenerationUserIdentityId(characterId?: string, appId?: string): string | null {
-  const scopedIdentityId = appId && ["chat", "moments", "group_chat"].includes(appId)
-    ? loadChatScope().userIdentityId
-    : null;
-  if (scopedIdentityId) return scopedIdentityId;
-  const identities = loadUserIdentities();
-  if (identities.length === 0) return null;
-  const boundId = resolveBinding(loadBindingConfig(), characterId, appId).userIdentityId;
-  return boundId && identities.some(identity => identity.id === boundId) ? boundId : identities[0].id;
 }
 
 function imageExtension(mimeType: string): string {
@@ -351,18 +293,7 @@ function extractModels(data: unknown): string[] {
 
 async function fetchImageUrlAsBase64(url: string, signal?: AbortSignal): Promise<{ b64: string; mimeType: string }> {
   throwIfAborted(signal);
-  let res: Response;
-  try {
-    res = await fetch(url, { signal });
-    if (!res.ok) throw new Error(`图片下载 HTTP ${res.status}`);
-  } catch {
-    throwIfAborted(signal);
-    // Download only: this endpoint never calls a generation API or receives its key.
-    res = await fetch("/api/image-generation/download", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }), signal,
-    });
-  }
+  const res = await fetch(url, { signal });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`图片 URL 下载失败 ${res.status}: ${text.slice(0, 160)}`);
@@ -373,7 +304,7 @@ async function fetchImageUrlAsBase64(url: string, signal?: AbortSignal): Promise
   return { b64: cleaned.b64, mimeType: cleaned.mimeType || blob.type || "image/png" };
 }
 
-async function parseImageGenerationResponse(res: Response, signal?: AbortSignal, resultKey?: string): Promise<ImageGenerationApiResponse> {
+async function parseImageGenerationResponse(res: Response, signal?: AbortSignal): Promise<ImageGenerationApiResponse> {
   throwIfAborted(signal);
   const contentType = (res.headers.get("content-type") || "").toLowerCase();
   if (!res.ok) {
@@ -397,7 +328,6 @@ async function parseImageGenerationResponse(res: Response, signal?: AbortSignal,
   }
 
   if (extracted.kind === "url") {
-    if (resultKey) return recoverImageResult(resultKey, extracted, signal);
     const downloaded = await fetchImageUrlAsBase64(extracted.url, signal);
     return { ...downloaded, revisedPrompt: extracted.revisedPrompt };
   }
@@ -461,31 +391,35 @@ export const IMAGE_GEN_PROXY_URL = (process.env.NEXT_PUBLIC_IMAGE_GEN_PROXY_URL 
 async function generateImageDirect(params: {
   settings: ImageGenerationSettings;
   prompt: string;
-  referenceImageDataUrl: string | null;
+  referenceImageDataUrls: string[];
   signal?: AbortSignal;
   /** 走通用代理:请求发往代理地址,真实上游放进 x-upstream-base-url 头 */
   proxyBaseUrl?: string;
 }): Promise<ImageGenerationApiResponse> {
-  const { settings, prompt, referenceImageDataUrl, signal, proxyBaseUrl } = params;
+  const { settings, prompt, referenceImageDataUrls, signal, proxyBaseUrl } = params;
   throwIfAborted(signal);
-  const resultKey = await imageResultKey(params);
-  const pending = pendingResult(resultKey);
-  if (pending) return recoverImageResult(resultKey, pending, signal);
-  const hasReference = Boolean(referenceImageDataUrl);
+  const hasReference = referenceImageDataUrls.length > 0;
   const url = buildImageUrl(proxyBaseUrl || settings.baseUrl, hasReference ? "edits" : "generations");
   const headers: Record<string, string> = { Authorization: `Bearer ${settings.apiKey}` };
   if (proxyBaseUrl) headers["x-upstream-base-url"] = normalizeBaseUrl(settings.baseUrl);
   let body: BodyInit;
 
   if (hasReference) {
-    const converted = dataUrlToBlob(referenceImageDataUrl || "");
-    if (!converted) throw new Error("参考图格式无效");
+    const convertedReferences = referenceImageDataUrls.map(dataUrl => dataUrlToBlob(dataUrl));
+    const invalidIndex = convertedReferences.findIndex(reference => !reference);
+    if (invalidIndex >= 0) throw new Error(`第 ${invalidIndex + 1} 张参考图格式无效`);
     const form = new FormData();
     form.set("model", settings.model);
     form.set("prompt", prompt);
     if (settings.size && settings.size !== "auto") form.set("size", settings.size);
     if (settings.quality && settings.quality !== "auto") form.set("quality", settings.quality);
-    form.append("image", converted.blob, `reference.${imageExtension(converted.mimeType)}`);
+    convertedReferences.forEach((converted, index) => {
+      if (!converted) return;
+      // OpenAI Images edits accepts repeated image[] inputs. Keep the legacy single-image
+      // field for providers that only understand the older OpenAI-compatible shape.
+      const fieldName = convertedReferences.length > 1 ? "image[]" : "image";
+      form.append(fieldName, converted.blob, `reference-${index + 1}.${imageExtension(converted.mimeType)}`);
+    });
     body = form;
   } else {
     headers["Content-Type"] = "application/json";
@@ -504,16 +438,13 @@ async function generateImageDirect(params: {
   if (signal) signal.addEventListener("abort", onOuterAbort, { once: true });
   const totalTimer = setTimeout(() => controller.abort(), 360_000);
   try {
-    const res = await fetch(url, { method: "POST", headers, body, signal: controller.signal });
-    return await parseImageGenerationResponse(res, controller.signal, resultKey);
+    return await parseImageGenerationResponse(await fetch(url, { method: "POST", headers, body, signal: controller.signal }), signal);
   } catch (error) {
     if (controller.signal.aborted && !signal?.aborted) {
       throw new Error(proxyBaseUrl ? "生图代理超时（360 秒未返回）" : "生图请求超时（360 秒未返回）");
     }
     if (error instanceof TypeError) {
-      throw new Error(proxyBaseUrl
-        ? "生图代理连接或响应读取失败；上游可能已经生成图片，请先检查 API 后台，避免重复计费。"
-        : "生图请求连接或响应读取失败，可能受到跨域或网络限制；上游可能已经生成图片，请先检查 API 后台，避免重复计费。");
+      throw new Error(proxyBaseUrl ? "生图代理连接失败" : "浏览器直连失败：该 API 可能未允许跨域请求。");
     }
     throw error;
   } finally {
@@ -525,16 +456,42 @@ async function generateImageDirect(params: {
 // 「代理中转」模式:配置了通用代理(CF Worker)就只走它——用户选择什么模式就走什么链路,
 // 不做隐藏回落(不再兜底到 Netlify 函数,那会消耗站点额度且有 60s 上限)。
 // 常量未配置时保留旧的 Netlify 心跳流式路由(自部署无 Worker 的场景)。
-// 生成 POST 无法判断是否已经计费，因此禁止跨链路自动重发。
+//
+// Netlify 心跳路由是站点额度的最大计算开销之一(每张图占用函数 30~120s),而不少
+// 选了「服务端转发」的用户,其生图 API 其实允许跨域。因此走 Netlify 前先试一次
+// 浏览器直连:直连因 CORS 失败(预检被拒,真实请求未发出,上游不会计费)才回落
+// 到服务端,并按 baseUrl 记住失败结果,本次会话内不再重复探测。
+const directCorsFailedBaseUrls = new Set<string>();
 
 async function generateImageViaServerOrProxy(params: {
   settings: ImageGenerationSettings;
   prompt: string;
-  referenceImageDataUrl: string | null;
+  referenceImageDataUrls: string[];
   signal?: AbortSignal;
 }): Promise<ImageGenerationApiResponse> {
   if (IMAGE_GEN_PROXY_URL) {
-    return generateImageDirect({ ...params, proxyBaseUrl: IMAGE_GEN_PROXY_URL });
+    try {
+      return await generateImageDirect({ ...params, proxyBaseUrl: IMAGE_GEN_PROXY_URL });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("生图代理连接失败")) {
+        throw new Error("生图代理连接失败:当前网络可能无法访问代理服务器(部分地区需开启代理),或稍后重试。");
+      }
+      throw error;
+    }
+  }
+  const baseUrlKey = normalizeBaseUrl(params.settings.baseUrl);
+  if (!directCorsFailedBaseUrls.has(baseUrlKey)) {
+    try {
+      return await generateImageDirect(params);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // 只有连接层失败(CORS/断网)才回落;API 自身的错误(密钥无效、余额不足等)
+      // 说明直连是通的,换服务端转发也会得到同样错误,直接抛出避免重复计费。
+      if (!message.includes("浏览器直连失败")) throw error;
+      throwIfAborted(params.signal);
+      directCorsFailedBaseUrls.add(baseUrlKey);
+    }
   }
   return generateImageViaServer(params);
 }
@@ -542,14 +499,11 @@ async function generateImageViaServerOrProxy(params: {
 async function generateImageViaServer(params: {
   settings: ImageGenerationSettings;
   prompt: string;
-  referenceImageDataUrl: string | null;
+  referenceImageDataUrls: string[];
   signal?: AbortSignal;
 }): Promise<ImageGenerationApiResponse> {
-  const { settings, prompt, referenceImageDataUrl, signal } = params;
+  const { settings, prompt, referenceImageDataUrls, signal } = params;
   throwIfAborted(signal);
-  const resultKey = await imageResultKey(params);
-  const pending = pendingResult(resultKey);
-  if (pending) return recoverImageResult(resultKey, pending, signal);
   // 防"无限卡住":函数被平台中途击杀时流可能既不关闭也不报错。
   // 总超时 180s + 断流检测(心跳每 3s 一个字节,超过 25s 没有任何字节视为断流)。
   const controller = new AbortController();
@@ -570,12 +524,12 @@ async function generateImageViaServer(params: {
         prompt,
         size: settings.size,
         quality: settings.quality,
-        referenceImageDataUrl: referenceImageDataUrl || undefined,
+        referenceImageDataUrls: referenceImageDataUrls.length ? referenceImageDataUrls : undefined,
       }),
     });
     throwIfAborted(signal);
 
-    type ServerImagePayload = { httpStatus?: number; b64?: string; mimeType?: string; revisedPrompt?: string; error?: string; imageUrl?: string; generationCompleted?: boolean };
+    type ServerImagePayload = { httpStatus?: number; b64?: string; mimeType?: string; revisedPrompt?: string; error?: string };
     const contentType = (res.headers.get("content-type") || "").toLowerCase();
     let data: ServerImagePayload;
     if (contentType.includes("text/plain")) {
@@ -612,7 +566,6 @@ async function generateImageViaServer(params: {
         throw new Error("生图请求失败（流式结果解析出错）");
       }
       throwIfAborted(signal);
-      if (data.generationCompleted && data.imageUrl) return await recoverImageResult(resultKey, { url: data.imageUrl, revisedPrompt: data.revisedPrompt }, controller.signal);
       if (data.error || !data.b64) {
         throw new Error(data.error || `生图请求失败 ${data.httpStatus ?? res.status}`);
       }
@@ -620,7 +573,6 @@ async function generateImageViaServer(params: {
       // 非流式回退(旧服务端等)
       data = await res.json().catch(() => ({})) as ServerImagePayload;
       throwIfAborted(signal);
-      if (data.generationCompleted && data.imageUrl) return await recoverImageResult(resultKey, { url: data.imageUrl, revisedPrompt: data.revisedPrompt }, controller.signal);
       if (!res.ok || data.error || !data.b64) {
         throw new Error(data.error || `生图请求失败 ${res.status}`);
       }
@@ -634,17 +586,16 @@ async function generateImageViaServer(params: {
 
 async function generateNovelAiDirect(params: {
   apiKey: string;
-  customUrl?: string;
   preset: NovelAiPreset;
   prompt: string;
   signal?: AbortSignal;
 }): Promise<ImageGenerationApiResponse> {
-  const { apiKey, customUrl, preset, prompt, signal } = params;
+  const { apiKey, preset, prompt, signal } = params;
   throwIfAborted(signal);
 
   const { width, height } = getNovelAiResolution(preset.resolution);
 
-  const url = customUrl?.trim() || "https://image.novelai.net/ai/generate-image";
+  const url = "https://image.novelai.net/ai/generate-image";
   const headers: Record<string, string> = {
     Authorization: `Bearer ${apiKey}`,
     "Content-Type": "application/json",
@@ -723,12 +674,11 @@ async function generateNovelAiDirect(params: {
 
 async function generateNovelAiViaServer(params: {
   apiKey: string;
-  customUrl?: string;
   preset: NovelAiPreset;
   prompt: string;
   signal?: AbortSignal;
 }): Promise<ImageGenerationApiResponse> {
-  const { apiKey, customUrl, preset, prompt, signal } = params;
+  const { apiKey, preset, prompt, signal } = params;
   throwIfAborted(signal);
 
   const controller = new AbortController();
@@ -745,7 +695,6 @@ async function generateNovelAiViaServer(params: {
       body: JSON.stringify({
         provider: "novelai",
         apiKey,
-        baseUrl: customUrl?.trim() || undefined,
         model: normalizeNovelAiModel(preset.model),
         prompt,
         size: resolution.value,
@@ -850,14 +799,26 @@ export async function fetchNovelAiModels(apiKey: string): Promise<string[]> {
   }
 }
 
-export async function generateImageFromConfiguredApi(params: {
+function descriptionExplicitlyIncludesPlayer(description: string): boolean {
+  return /(?:玩家本人|玩家入镜|玩家出镜|用户本人|用户形象|用户入镜|用户出镜|我的形象|我的照片|我入镜|我出镜|我在画面|我也在画面|本人入镜|本人出镜|主人本人|主人入镜|主人出镜|主人的形象|我和.{0,24}(?:一起|合照|合影|同框|在画面)|和我.{0,24}(?:一起|合照|合影|同框)|与我.{0,24}(?:一起|合照|合影|同框)|跟我.{0,24}(?:一起|合照|合影|同框)|你和.{0,24}(?:一起|合照|合影|同框|入镜|出镜)|和你.{0,24}(?:一起|合照|合影|同框|入镜|出镜)|与主人.{0,24}(?:一起|合照|合影|同框|入镜|出镜)|和主人.{0,24}(?:一起|合照|合影|同框|入镜|出镜)|我们(?:一起|合照|合影|同框|出镜|入镜)|with me|me in (?:the|this) (?:image|picture)|my appearance|I am (?:in|pictured in)|the user(?: appears| is in the image)?|player character)/i.test(description);
+}
+
+const DEFAULT_IDENTITY_FACE_CROP = { x: 0.27, y: 0.12, size: 0.46 };
+
+async function generateImageFromConfiguredApiInternal(params: {
   description: string;
   characterId?: string;
+  /** 画面中实际出镜的角色 ID；多角色图片会逐个附加身份参考，而不是拼成固定合照。 */
+  characterIds?: string[];
+  /** 本次场景的明确出镜人员 ID；用户本人使用保留 ID "__user__"。 */
+  participantIds?: string[];
+  /** 兼容旧调用方；新调用方应使用 participantIds。 */
+  includeUserAppearance?: boolean;
   /** 内容所属 APP；用于按“角色 > APP > 全局”解析生图方案。 */
   appId?: string;
   useReferenceImage?: boolean;
-  /** 强制是否加入角色当前绑定用户的参考图；未传时根据合照/用户照片语义自动判断。 */
-  includeUserReferenceImage?: boolean;
+  /** Optional supplemental scene reference, retained for older callers. */
+  referenceImageDataUrl?: string;
   settings?: ImageGenerationSettings;
   signal?: AbortSignal;
 }): Promise<ImageGenerationResult | null> {
@@ -874,7 +835,41 @@ export async function generateImageFromConfiguredApi(params: {
   const description = params.description.trim();
   if (!description) return null;
 
-  // NovelAI 模式
+  const allCharacters = loadCharacters();
+  const characterById = new Map(allCharacters.map(character => [character.id, character]));
+  const matchedIds = allCharacters
+    .filter(character => character.id !== params.characterId && Boolean(character.name?.trim()) && description.includes(character.name.trim()))
+    .map(character => character.id);
+  const inferredCharacterIds = Array.from(new Set([
+    ...(params.characterId ? [params.characterId] : []),
+    ...(params.characterIds ?? []),
+    ...matchedIds,
+  ])).filter(characterId => characterById.has(characterId)).slice(0, 16);
+  // 所有生图调用最终都归一化为一份明确的出镜名单；调用方名单优先，旧调用方才回退到描述识别。
+  const resolvedParticipantIds = params.participantIds
+    ? Array.from(new Set(params.participantIds)).filter(id => id === "__user__" || characterById.has(id))
+    : [...inferredCharacterIds, ...((params.includeUserAppearance ?? descriptionExplicitlyIncludesPlayer(description)) ? ["__user__"] : [])];
+  const involvedCharacterIds = resolvedParticipantIds.filter(id => id !== "__user__" && characterById.has(id)).slice(0, 16);
+  const includeUserAppearance = resolvedParticipantIds.includes("__user__");
+
+  const characterIdentityPrompt = involvedCharacterIds.map(characterId => {
+    const character = characterById.get(characterId);
+    const characterReference = settings.characterReferences?.[characterId];
+    const featurePrompt = characterReference?.featurePrompt?.trim();
+    if (!character || !featurePrompt || (settings.provider === "novelai" && characterReference?.novelAiFeaturePromptEnabled === false)) return "";
+    return `${character.name}的稳定身份特征（不固定临时服装和姿态）：${featurePrompt}`;
+  }).filter(Boolean);
+  const userReference = settings.characterReferences?.["__user__"];
+  const userAppearancePrompt = includeUserAppearance && userReference?.featurePrompt?.trim()
+    ? `玩家本人稳定外观（只用于识别本人；服装、姿势、表情和场景以本次提示词为准）：${userReference.featurePrompt.trim()}`
+    : "";
+  const identityPolicy = (involvedCharacterIds.length || includeUserAppearance)
+    ? "身份参考规则：只保持每个人可识别的身份特征，例如面部、五官、发色、发型及明显识别标记。不要照搬参考图的服装、姿势、表情、站位、镜头、构图、背景或光线；这些内容必须服从本次场景描述，可以每次变化。"
+    : "";
+  const identityPrompt = [identityPolicy, ...characterIdentityPrompt, userAppearancePrompt].filter(Boolean).join("\n");
+
+  // NovelAI 当前生成接口不接收多张身份参考图。仍传入每位出镜角色的文字身份锚点，
+  // 不把多张脸图混成一张参考图，避免模型将多位角色的身份融合。
   if (settings.provider === "novelai") {
     const naiApiKey = settings.novelai?.apiKey?.trim();
     if (!naiApiKey) return null;
@@ -884,34 +879,16 @@ export async function generateImageFromConfiguredApi(params: {
       : [DEFAULT_NOVELAI_PRESET];
     const activePreset = presets.find(p => p.id === settings.novelai?.activePresetId) || presets[0];
 
-    // 本轮画面描述必须排在最前面。NovelAI 对提示词顺序较敏感；此前把预设、
-    // 人物外观和锚点放在描述前面，长提示词下会让聊天/朋友圈的当前场景失去权重。
-    const positiveParts: string[] = [description];
-    const novelAiCharacterReference = params.characterId
-      ? settings.characterReferences?.[params.characterId]
-      : undefined;
-    const characterFeaturePrompt = novelAiCharacterReference?.novelAiFeaturePromptEnabled !== false
-      ? novelAiCharacterReference?.featurePrompt?.trim()
-      : "";
-    if (characterFeaturePrompt) positiveParts.push(characterFeaturePrompt);
-    const anchorPrompt = (novelAiCharacterReference?.anchors || [])
-      .filter(anchor => anchor.enabled !== false && anchor.description.trim())
-      .map(anchor => `${anchor.name}: ${anchor.description.trim()}`)
-      .join(", ");
-    if (anchorPrompt) positiveParts.push(anchorPrompt);
+    const positiveParts: string[] = [];
     if (activePreset.positivePrompt?.trim()) positiveParts.push(activePreset.positivePrompt.trim());
+    if (identityPrompt) positiveParts.push(identityPrompt);
+    if (description) positiveParts.push(description);
     const fullPrompt = positiveParts.join(", ");
 
     const novelAiRequestMode = settings.novelai?.requestMode || settings.requestMode;
-    const novelAiCustomUrl = settings.novelai?.customUrlEnabled
-      ? settings.novelai.customUrl?.trim()
-      : undefined;
-    if (settings.novelai?.customUrlEnabled && !novelAiCustomUrl) {
-      throw new Error("请填写 NovelAI 自定义 URL。");
-    }
     const data = novelAiRequestMode === "direct"
-      ? await generateNovelAiDirect({ apiKey: naiApiKey, customUrl: novelAiCustomUrl, preset: activePreset, prompt: fullPrompt, signal: params.signal })
-      : await generateNovelAiViaServer({ apiKey: naiApiKey, customUrl: novelAiCustomUrl, preset: activePreset, prompt: fullPrompt, signal: params.signal });
+      ? await generateNovelAiDirect({ apiKey: naiApiKey, preset: activePreset, prompt: fullPrompt, signal: params.signal })
+      : await generateNovelAiViaServer({ apiKey: naiApiKey, preset: activePreset, prompt: fullPrompt, signal: params.signal });
 
     throwIfAborted(params.signal);
     const mimeType = data.mimeType || "image/png";
@@ -926,73 +903,100 @@ export async function generateImageFromConfiguredApi(params: {
       mimeType,
       prompt: fullPrompt,
       usedReferenceImage: false,
+      referenceImageCount: 0,
+      referenceImageLabels: [],
       revisedPrompt: data.revisedPrompt,
     };
   }
 
-  // OpenAI 兼容模式：使用当前激活预设（旧配置由存储层迁移后仍保持兼容）
+  // OpenAI 兼容模式：按真实出镜人物分别读取脸部裁切图，让接口知道每张图对应哪位角色。
   const openaiPreset = settings.openaiPresets?.find(preset => preset.id === settings.activeOpenAiPresetId)
     || settings.openaiPresets?.[0];
   const openaiSettings = openaiPreset ? { ...settings, ...openaiPreset } : settings;
   if (!openaiSettings.apiKey.trim() || !openaiSettings.baseUrl.trim() || !openaiSettings.model.trim()) return null;
 
-  const reference = params.characterId ? settings.characterReferences?.[params.characterId] : undefined;
-  // 「非自拍不使用参考图」开关已从生图设置页删除：参考图启用后始终参与生成
-  const shouldUseReference = Boolean(
-    params.useReferenceImage
-    && reference?.assetId
-    && reference.enabled !== false,
-  );
-  const referenceInputs: Array<{ dataUrl: string; label: string }> = [];
-  if (shouldUseReference && reference?.assetId) {
-    const raw = await getChatImageFromIndexedDB(reference.assetId);
-    if (raw) referenceInputs.push({
-      dataUrl: await normalizeReferenceImageForEdit(raw, reference.faceCrop),
-      label: "角色参考",
-    });
+  let referenceSources: ReferenceSource[] = [];
+  const suppliedReferenceImageDataUrl = params.referenceImageDataUrl?.trim() || null;
+  if (suppliedReferenceImageDataUrl) {
+    referenceSources.push({ label: "补充场景参考", dataUrl: suppliedReferenceImageDataUrl });
   }
-  const activeAnchors = (reference?.anchors || []).filter(anchor => anchor.enabled !== false);
-  for (const anchor of activeAnchors) {
-    if (!anchor.assetId) continue;
-    const raw = await getChatImageFromIndexedDB(anchor.assetId);
-    if (raw) referenceInputs.push({ dataUrl: raw, label: `锚点：${anchor.name || "特征"}` });
+
+  const appendCharacterReference = async (characterId: string) => {
+    const reference = settings.characterReferences?.[characterId];
+    if (!reference?.assetId) return;
+    const dataUrl = await getChatImageFromIndexedDB(reference.assetId);
+    if (dataUrl) {
+      const character = characterById.get(characterId);
+      referenceSources.push({
+        label: character?.name || "角色",
+        dataUrl,
+        crop: reference.faceCrop || DEFAULT_IDENTITY_FACE_CROP,
+      });
+    }
+  };
+
+  {
+    // Identity references are automatic by default; only an explicit per-image opt-out disables them.
+    // Primary character is first. This ensures the current chat speaker's identity remains the anchor.
+    // "current" is a single-speaker shortcut only for one-person images.
+    // Explicit multi-character scenes must retain every participant's identity reference.
+    const referenceCharacterIds = settings.referenceImageMode === "current" && involvedCharacterIds.length <= 1
+      ? involvedCharacterIds.slice(0, 1)
+      : involvedCharacterIds;
+    for (const characterId of referenceCharacterIds) {
+      await appendCharacterReference(characterId);
+      throwIfAborted(params.signal);
+    }
+
   }
-  const identityId = resolveGenerationUserIdentityId(params.characterId, params.appId);
-  const userIdentity = identityId ? loadUserIdentities().find(identity => identity.id === identityId) : undefined;
-  const userReference = identityId ? settings.userReferences?.[identityId] : undefined;
-  const includeUserReference = params.includeUserReferenceImage ?? descriptionNeedsUserReference(description, userIdentity?.name);
-  if (includeUserReference && userReference?.assetId && userReference.enabled !== false) {
-    const raw = await getChatImageFromIndexedDB(userReference.assetId);
-    if (raw) referenceInputs.push({
-      dataUrl: await normalizeReferenceImageForEdit(raw, userReference.faceCrop),
-      label: `用户参考：${userIdentity?.name || "用户"}`,
-    });
+
+  // 用户本人使用与普通角色相同的身份参考结构，只有明确列入本次出镜名单时才加入。
+  if (includeUserAppearance) {
+    const user = settings.characterReferences?.["__user__"];
+    if (user?.assetId) {
+      const dataUrl = await getChatImageFromIndexedDB(user.assetId);
+      if (dataUrl) referenceSources.splice(suppliedReferenceImageDataUrl ? 1 : 0, 0, {
+        label: "用户本人", dataUrl, crop: user.faceCrop || DEFAULT_IDENTITY_FACE_CROP,
+      });
+    }
   }
-  throwIfAborted(params.signal);
-  const referenceImageDataUrl = await combineReferenceImagesForEdit(referenceInputs);
-  throwIfAborted(params.signal);
-  const characterPrompt = reference?.featurePrompt?.trim() || "";
-  const anchorsPrompt = activeAnchors
-    .filter(anchor => anchor.description.trim())
-    .map(anchor => `${anchor.name || "特征"}：${anchor.description.trim()}`)
-    .join("；");
-  const userPrompt = includeUserReference && userIdentity
-    ? `【用户身份参考】${userIdentity.name}${userIdentity.gender && userIdentity.gender !== "保密" ? `，${userIdentity.gender}` : ""}。合照中必须保持用户与角色是两个不同人物，不得混脸。`
+
+  let collageLegend = "";
+  if (settings.referenceImageMode === "collage" && referenceSources.length > 1) {
+    const collage = await buildReferenceCollage(referenceSources);
+    if (collage) {
+      collageLegend = collage.legend;
+      referenceSources = [{ label: `多人身份参考拼图（${collage.legend}）`, dataUrl: collage.dataUrl }];
+    }
+  }
+
+  const limitedSources = referenceSources.slice(0, 16);
+  const referenceImageDataUrls: string[] = [];
+  const referenceLabels: string[] = [];
+  for (const source of limitedSources) {
+    throwIfAborted(params.signal);
+    const normalized = await normalizeReferenceImageForEdit(source.dataUrl, source.crop);
+    referenceImageDataUrls.push(normalized);
+    referenceLabels.push(source.label);
+  }
+
+  const referenceMapPrompt = referenceLabels.length
+    ? [
+        "【身份参考图对应关系】",
+        ...(collageLegend
+          ? [`参考图1是多人身份参考拼图，编号对应：${collageLegend}。只按编号参考对应人物的脸，不要互换、复制或融合不同角色的身份。`]
+          : referenceLabels.map((label, index) => `参考图${index + 1}对应：${label}。只参考该人物的身份特征，不代表固定服装或固定构图。`)),
+        "每位出镜人物都必须对应自己的参考图，不要互换、复制或融合不同角色的脸。"
+      ].join("\n")
     : "";
   const prompt = mergePrompt(
-    [
-      description,
-      characterPrompt ? `【角色固定外观】${characterPrompt}` : "",
-      anchorsPrompt ? `【角色特定锚点】${anchorsPrompt}` : "",
-      userPrompt,
-      referenceInputs.length > 1 ? `【参考图说明】上传的是分格参考板，共 ${referenceInputs.length} 格；请按每格下方标签分别还原人物或物件，不要把不同格的身份混合。` : "",
-    ].filter(Boolean).join("\n\n"),
+    mergePrompt(description, [identityPrompt, referenceMapPrompt].filter(Boolean).join("\n")),
     openaiSettings.extraPrompt,
   );
 
   const data = openaiSettings.requestMode === "direct"
-    ? await generateImageDirect({ settings: openaiSettings, prompt, referenceImageDataUrl, signal: params.signal })
-    : await generateImageViaServerOrProxy({ settings: openaiSettings, prompt, referenceImageDataUrl, signal: params.signal });
+    ? await generateImageDirect({ settings: openaiSettings, prompt, referenceImageDataUrls, signal: params.signal })
+    : await generateImageViaServerOrProxy({ settings: openaiSettings, prompt, referenceImageDataUrls, signal: params.signal });
 
   throwIfAborted(params.signal);
   const mimeType = data.mimeType || "image/png";
@@ -1006,9 +1010,107 @@ export async function generateImageFromConfiguredApi(params: {
     blob,
     mimeType,
     prompt,
-    usedReferenceImage: Boolean(referenceImageDataUrl),
+    usedReferenceImage: referenceImageDataUrls.length > 0,
+    referenceImageCount: referenceImageDataUrls.length,
+    referenceImageLabels: referenceLabels,
     revisedPrompt: data.revisedPrompt,
   };
+}
+
+
+type ImageGenerationCallRecord = {
+  id: string;
+  startedAt: string;
+  durationMs: number;
+  appId?: string;
+  provider: string;
+  model: string;
+  participantIds: string[];
+  participantNames: string[];
+  referenceImageMode: string;
+  usedReferenceImage: boolean;
+  referenceImageCount?: number;
+  referenceImageLabels?: string[];
+  prompt: string;
+  status: "success" | "failed" | "skipped";
+  error?: string;
+};
+
+const IMAGE_GENERATION_CALLS_KEY = "ai_phone_image_generation_calls_v1";
+
+/** Local, bounded diagnostics for image requests. API credentials and request headers are never stored. */
+export function loadImageGenerationCallRecords(): ImageGenerationCallRecord[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const value = JSON.parse(window.localStorage.getItem(IMAGE_GENERATION_CALLS_KEY) || "[]");
+    return Array.isArray(value) ? value.slice(0, 80) as ImageGenerationCallRecord[] : [];
+  } catch {
+    return [];
+  }
+}
+
+export function clearImageGenerationCallRecords(): void {
+  if (typeof window !== "undefined") window.localStorage.removeItem(IMAGE_GENERATION_CALLS_KEY);
+}
+
+function saveImageGenerationCallRecord(record: ImageGenerationCallRecord): void {
+  if (typeof window === "undefined") return;
+  try {
+    const next = [record, ...loadImageGenerationCallRecords()].slice(0, 80);
+    window.localStorage.setItem(IMAGE_GENERATION_CALLS_KEY, JSON.stringify(next));
+    window.dispatchEvent(new Event("image-generation-diagnostics-updated"));
+  } catch (error) {
+    console.warn("[ImageGeneration] diagnostics write failed", error);
+  }
+}
+
+export async function generateImageFromConfiguredApi(params: Parameters<typeof generateImageFromConfiguredApiInternal>[0]): Promise<ImageGenerationResult | null> {
+  const started = Date.now();
+  const startedAt = new Date(started).toISOString();
+  const settings = params.settings ?? loadImageGenerationSettings();
+  const characters = loadCharacters();
+  const ids = Array.from(new Set([
+    ...(params.participantIds ?? []),
+    ...(params.characterIds ?? []),
+    ...(params.characterId ? [params.characterId] : []),
+  ]));
+  const participantIds = ids.slice(0, 16);
+  const participantNames = participantIds.map(id => id === "__user__" ? "用户本人" : characters.find(item => item.id === id)?.name || id);
+  const baseRecord: Omit<ImageGenerationCallRecord, "durationMs" | "status" | "prompt" | "usedReferenceImage"> = {
+    id: "image-call-" + started.toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+    startedAt,
+    appId: params.appId,
+    provider: settings.provider || "unknown",
+    model: settings.provider === "novelai"
+      ? settings.novelai?.presets?.find(item => item.id === settings.novelai?.activePresetId)?.model || settings.novelai?.presets?.[0]?.model || "unknown"
+      : settings.openaiPresets?.find(item => item.id === settings.activeOpenAiPresetId)?.model || settings.openaiPresets?.[0]?.model || settings.model || "unknown",
+    participantIds,
+    participantNames,
+    referenceImageMode: settings.referenceImageMode || "automatic",
+  };
+  try {
+    const result = await generateImageFromConfiguredApiInternal(params);
+    saveImageGenerationCallRecord({
+      ...baseRecord,
+      durationMs: Date.now() - started,
+      status: result ? "success" : "skipped",
+      prompt: result?.prompt?.slice(0, 6000) || params.description.slice(0, 6000),
+      usedReferenceImage: result?.usedReferenceImage === true,
+      referenceImageCount: result?.referenceImageCount,
+      referenceImageLabels: result?.referenceImageLabels,
+    });
+    return result;
+  } catch (error) {
+    saveImageGenerationCallRecord({
+      ...baseRecord,
+      durationMs: Date.now() - started,
+      status: "failed",
+      prompt: params.description.slice(0, 6000),
+      usedReferenceImage: Boolean(params.referenceImageDataUrl || params.useReferenceImage),
+      error: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+    });
+    throw error;
+  }
 }
 
 export function generatedImageFilename(description: string, mimeType = "image/png"): string {
@@ -1024,11 +1126,4 @@ export function hasCharacterReferenceImage(characterId?: string): boolean {
   const settings = loadImageGenerationSettings();
   const ref = settings.characterReferences?.[characterId];
   return Boolean(ref?.assetId);
-}
-
-export function hasUserReferenceImage(characterId?: string, appId = "chat"): boolean {
-  const identityId = resolveGenerationUserIdentityId(characterId, appId);
-  if (!identityId) return false;
-  const ref = loadImageGenerationSettings().userReferences?.[identityId];
-  return Boolean(ref?.assetId && ref.enabled !== false);
 }

@@ -7,8 +7,9 @@ import type { RegexConfig } from "./settings-types";
 import { stripHallucinatedTimestamps } from "./llm-provider-adapter";
 import { MacroEngine } from "./macro-engine";
 import { getActiveAppTags } from "./content-tag-utils";
+import { parseLifeOutput } from "./life/life-output";
 import { loadChatMessages, loadChatSessions, reindexSessionMessageOrdersByTime } from "./chat-storage";
-import { hasAccountPushSubscription } from "./push-client";
+import { hasAccountPushSubscription, isShellEnvironment } from "./push-client";
 import { isPersonalPushCloudActive, loadPersonalPushCloudState, personalPushFetch } from "./personal-push-cloud";
 import { removeTimedWakeSchedule } from "./timed-wake-storage";
 import { appendBridgeFeed } from "./reality-bridge/storage";
@@ -30,8 +31,15 @@ type OutboxEntry = {
         appTags?: string[];
         followUpCount?: number;
         armAt?: string;
+        /** 挂单时最后一条用户消息的因果锚点；回端时若用户已发新消息，旧回复必须丢弃 */
+        snapshotLastUserMessageId?: string;
+        snapshotLastUserMessageAt?: string;
+        replyAfterLocalMessageId?: string;
+        replyAfterCreatedAt?: string;
         /** 云端触发快捷动作失败的摘要；成功时不带这个字段 */
         shortcutDeliveryError?: string;
+        /** Server-generated proactive life-scene turn; must never be merged into online chat. */
+        lifeScene?: { sceneId?: string; characterId?: string; characterName?: string };
     } | null;
     created_at: string;
 };
@@ -54,11 +62,23 @@ function clearTimedWakeIfHandled(triggerKey: string | null): void {
     const timedWakeId = getTimedWakeIdFromTriggerKey(triggerKey);
     if (timedWakeId) removeTimedWakeSchedule(timedWakeId);
 }
+function parseLifeSceneProactiveOutput(raw: string): { action: string; dialogues: string[] } {
+    // 服务端离线生活主动现在也走 JSON 协议；保留旧 XML/纯文本兜底。
+    const parsed = parseLifeOutput(raw);
+    return {
+        action: parsed.action?.trim() || "",
+        dialogues: parsed.dialogues.map(item => item.trim()).filter(Boolean),
+    };
+}
 
 export async function consumeServerOutbox(options?: { silent?: boolean; force?: boolean }): Promise<void> {
     if (typeof window === "undefined") return;
+    // 壳环境的任务与回传箱都走站点（账号 id 与壳订阅一致，见 pushJobsFetch）：
+    // 服务端生成的消息落在站点库里，user_id = 站点账号 id。个人云那条路在壳里
+    // 是断的（网关按 OWNER_ID 存取），所以壳必须读站点回传箱，不能读个人云。
+    const shellMode = isShellEnvironment();
     // 共享回传箱已紧急停用：没有个人 Supabase 时直接结束，不请求 status/outbox。
-    if (!isPersonalPushCloudActive()) return;
+    if (!shellMode && !isPersonalPushCloudActive()) return;
     if (consuming) return;
     if (options?.force !== true && Date.now() - lastConsumeAt < OUTBOX_FOREGROUND_CHECK_INTERVAL_MS) return;
     // 没有任何设备订阅推送时，服务端不可能产生普通离线回传；避免所有在线用户空轮询。
@@ -67,8 +87,8 @@ export async function consumeServerOutbox(options?: { silent?: boolean; force?: 
     lastConsumeAt = Date.now();
     const passStartMs = Date.now();
     try {
-        // 共享回传箱已停用，只读取用户自己的 Supabase。
-        const sources: Array<"personal" | "shared"> = ["personal"];
+        // 壳读站点回传箱（与它的任务同源）；其余情况读个人云回传箱。
+        const sources: Array<"personal" | "shared"> = shellMode ? ["shared"] : ["personal"];
         const handledTriggerKeys = new Set<string>();
         for (const source of sources) {
           for (let batch = 0; batch < MAX_OUTBOX_BATCHES_PER_PASS; batch += 1) {
@@ -150,6 +170,78 @@ export async function consumeServerOutbox(options?: { silent?: boolean; force?: 
                     // 都没发生，写进现实桥动态让用户查得到原因。这是一条独立的
                     // outbox 行（云端在投递之后才写），不是角色消息——消费掉即可，
                     // 绝不能走下面的建消息流程，否则聊天里会凭空多出一条。
+                    // Life-scene output has its own durable destination. Never insert it into the
+                    // character's online chat history, even though the push job uses that session
+                    // only to build the provider snapshot and carry notification metadata.
+                    const lifeScene = meta.lifeScene;
+                    if (lifeScene?.sceneId && lifeScene.characterId) {
+                        const lifeCharacterId = lifeScene.characterId;
+                        const { loadVirtualLifeState, saveVirtualLifeState, appendLifeTimelineEntry } = await import("./life/life-storage");
+                        const state = loadVirtualLifeState();
+                        const scene = state.scenes.find(item => item.id === lifeScene.sceneId && item.status === "active");
+                        const playerPresent = scene?.participants.some(item => item.ownerType === "player" && item.ownerId === "player");
+                        const characterPresent = scene?.participants.some(item => item.ownerType === "character" && item.ownerId === lifeCharacterId && item.activity !== "离开");
+                        const messageBaseId = "life-outbox-" + entry.id;
+                        if (scene && playerPresent && characterPresent && !state.sceneMessages.some(item => item.id.startsWith(messageBaseId))) {
+                            const parsed = parseLifeSceneProactiveOutput(entry.raw_text);
+                            if (parsed.action || parsed.dialogues.length > 0) {
+                                const now = new Date().toISOString();
+                                const speakerName = lifeScene.characterName || meta.characterName || "角色";
+                                // 与在线路径保持一致：action 单独一张卡，dialogue 按段拆成多条气泡。
+                                const newMessages = [
+                                    ...(parsed.action ? [{
+                                        id: `${messageBaseId}-action`, sceneId: scene.id, speakerType: "character" as const,
+                                        speakerId: lifeCharacterId, speakerName, role: "character" as const,
+                                        action: parsed.action, dialogue: "", createdAt: now, channel: "life_offline" as const,
+                                    }] : []),
+                                    ...parsed.dialogues.map((text, index) => ({
+                                        id: `${messageBaseId}-dialogue-${index}`, sceneId: scene.id, speakerType: "character" as const,
+                                        speakerId: lifeCharacterId, speakerName, role: "character" as const,
+                                        action: undefined, dialogue: text, createdAt: now, channel: "life_offline" as const,
+                                    })),
+                                ];
+                                let next = {
+                                    ...state, sceneMessages: [...state.sceneMessages, ...newMessages],
+                                    scenes: state.scenes.map(item => item.id === scene.id ? { ...item, updatedAt: now } : item),
+                                };
+                                if (parsed.action) next = appendLifeTimelineEntry(next, {
+                                    category: "action", title: speakerName + "的行动", details: parsed.action,
+                                    actorId: lifeCharacterId, actorName: speakerName, locationName: scene.locationName,
+                                    sceneId: scene.id, sourceId: `${messageBaseId}-action`,
+                                });
+                                parsed.dialogues.forEach((text, index) => {
+                                    next = appendLifeTimelineEntry(next, {
+                                        category: "dialogue", title: speakerName + "说", details: text,
+                                        actorId: lifeCharacterId, actorName: speakerName, locationName: scene.locationName,
+                                        sceneId: scene.id, sourceId: `${messageBaseId}-dialogue-${index}`,
+                                    });
+                                });
+                                saveVirtualLifeState(next);
+                                const bannerDetail = {
+                                    sceneId: scene.id,
+                                    characterId: lifeScene.characterId,
+                                    characterName: speakerName,
+                                    avatar: "",
+                                    locationName: scene.locationName,
+                                    action: parsed.action || "",
+                                    dialogue: parsed.dialogues[0] || "",
+                                    createdAt: now,
+                                };
+                                // Persist a short-lived banner handoff as well as dispatching it.
+                                // If the life page is not mounted during outbox consumption, it can
+                                // still display the same life-scene banner when opened moments later.
+                                try {
+                                    localStorage.setItem("life-scene-pending-banner-v1", JSON.stringify(bannerDetail));
+                                } catch { /* banner is best-effort; the scene message is already saved */ }
+                                window.dispatchEvent(new CustomEvent("life-scene-proactive-message", { detail: bannerDetail }));
+                            }
+                        }
+                        // If the scene ended while the app was offline, consume the stale turn
+                        // rather than leaking it into online chat.
+                        consumedIds.push(entry.id);
+                        if (entry.trigger_key) handledTriggerKeys.add(entry.trigger_key);
+                        continue;
+                    }
                     if ((meta as { kind?: string }).kind === "shortcut_delivery_error") {
                         const detail = typeof meta.shortcutDeliveryError === "string"
                             ? meta.shortcutDeliveryError
@@ -181,14 +273,58 @@ export async function consumeServerOutbox(options?: { silent?: boolean; force?: 
                         saveMenstrualPeriodCareTrigger({ characterId: periodCare.characterId, sessionId, cycleKey: periodCare.cycleKey });
                     }
 
+                    const followUpIndex = typeof meta.followUpIndex === "number" ? meta.followUpIndex : undefined;
+                    const existingMessages = loadChatMessages(sessionId);
+
+                    // 因果锚点：服务端回复必须仍然接在挂单时那条用户消息后面。
+                    // 如果用户已经发了更新的消息，这条旧回复一旦落库就会被排到新消息后面，
+                    // 下一轮模型会接着旧话题说——宁可丢弃，也不能污染上下文。
+                    const latestUserMessage = [...existingMessages].reverse().find(message =>
+                        message.role === "user" && message.status !== "failed" && !message.isRetracted,
+                    );
+                    const snapshotUserId = typeof meta.snapshotLastUserMessageId === "string"
+                        ? meta.snapshotLastUserMessageId
+                        : "";
+                    const snapshotUserAt = typeof meta.snapshotLastUserMessageAt === "string"
+                        ? meta.snapshotLastUserMessageAt
+                        : "";
+                    const replyAfterId = typeof meta.replyAfterLocalMessageId === "string"
+                        ? meta.replyAfterLocalMessageId
+                        : "";
+                    const replyAfterAt = typeof meta.replyAfterCreatedAt === "string"
+                        ? meta.replyAfterCreatedAt
+                        : "";
+                    const replyAfterMessage = replyAfterId
+                        ? existingMessages.find(message => message.id === replyAfterId)
+                        : undefined;
+                    const replyAfterIsUser = replyAfterMessage?.role === "user" && !replyAfterMessage.isRetracted;
+                    const anchorUserId = snapshotUserId || (replyAfterIsUser ? replyAfterId : "");
+                    const anchorUserAt = snapshotUserAt || (replyAfterIsUser ? replyAfterAt : "");
+                    const anchorTime = anchorUserAt ? Date.parse(anchorUserAt) : NaN;
+                    const latestUserTime = latestUserMessage ? Date.parse(latestUserMessage.createdAt) : NaN;
+                    const staleByUser = Boolean(anchorUserId) && (!latestUserMessage || latestUserMessage.id !== anchorUserId);
+                    const staleByTime = Number.isFinite(anchorTime) && Number.isFinite(latestUserTime) && latestUserTime > anchorTime;
+                    if (staleByUser || staleByTime) {
+                        console.info("[PushOutbox] Dropped stale proactive reply", {
+                            entryId: entry.id,
+                            triggerKey: entry.trigger_key,
+                            anchorUserId,
+                            latestUserId: latestUserMessage?.id,
+                            anchorUserAt,
+                            latestUserAt: latestUserMessage?.createdAt,
+                        });
+                        clearTimedWakeIfHandled(entry.trigger_key);
+                        consumedIds.push(entry.id);
+                        if (entry.trigger_key) handledTriggerKeys.add(entry.trigger_key);
+                        continue;
+                    }
+
                     const idleMeta = (meta as { idleReconnect?: { ruleId?: string; firedAt?: number } }).idleReconnect;
                     if (idleMeta?.ruleId) {
                         const { markIdleReconnectFired } = await import("./idle-reconnect-storage");
                         markIdleReconnectFired(idleMeta.ruleId, typeof idleMeta.firedAt === "number" ? idleMeta.firedAt : Date.now());
                     }
 
-                    const followUpIndex = typeof meta.followUpIndex === "number" ? meta.followUpIndex : undefined;
-                    const existingMessages = loadChatMessages(sessionId);
                     if (followUpIndex && existingMessages.some(m => m.role === "assistant" && m.followUpIndex === followUpIndex)) {
                         clearTimedWakeIfHandled(entry.trigger_key);
                         consumedIds.push(entry.id);
@@ -273,8 +409,6 @@ export function installServerOutboxConsumer(): void {
     if (typeof window === "undefined" || consumerInstalled) return;
     consumerInstalled = true;
 
-    // 启动时保留 5 分钟节流；回前台和 SW 明确告知新消息时强制补拉。
-    // iOS 会在后台冻结页面，如果回前台仍被节流，屏幕速聊消息只能等到下次重启才会合并。
     const requestConsume = (force = false) => {
         if (consumeRequestTimer !== null) window.clearTimeout(consumeRequestTimer);
         consumeRequestTimer = window.setTimeout(() => {
@@ -283,7 +417,13 @@ export function installServerOutboxConsumer(): void {
         }, 150);
     };
 
-    requestConsume(false);
+    // 每次冷启动都强制拉一次（force=true 会绕过 consumeServerOutbox 内的 5 分钟节流）。
+    //
+    // 之前这里是非强制：用户若在 5 分钟内重开 App，启动拉取被节流跳过，聊天里就看不到
+    // 服务端已经生成、通知也已经弹过的那条消息——「弹窗比聊天里的消息慢」正是这么来的。
+    // 主动消息本来就该「打开 App 即见」，不该依赖用户去点那条通知，也不该被节流挡下。
+    // 代价仅是多一次 outbox 查询；服务端返回空列表时客户端立刻结束。
+    requestConsume(true);
     document.addEventListener("visibilitychange", () => {
         if (!document.hidden) requestConsume(true);
     });

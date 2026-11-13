@@ -22,8 +22,37 @@ import {
     toolNameMatches,
 } from "./tool-storage";
 import { executeCustomAppToolCall } from "./custom-app-tool-runtime";
+import { executeLifeToolCall } from "./life/life-tools";
+import { appendLifeTimelineEntry, loadVirtualLifeState, saveVirtualLifeState } from "./life/life-storage";
 import { characterWorkspace, agentComputerRequest, isAgentComputerConfigured } from "./agent-computer";
-import { AGENT_COMPUTER_CAPABILITY_ID, CALENDAR_MANAGEMENT_CAPABILITY_ID, LOCAL_DATA_LIBRARY_CAPABILITY_ID, MEMORY_WRITE_CAPABILITY_ID, MUSIC_CONTROL_CAPABILITY_ID, NOTE_WALL_CAPABILITY_ID, REALITY_BRIDGE_CAPABILITY_ID, SEND_FILE_CAPABILITY_ID, TIMED_WAKE_CAPABILITY_ID, TOOLBOX_MANAGEMENT_CAPABILITY_ID, getInternalCapability } from "./internal-capability-storage";
+import { AGENT_COMPUTER_CAPABILITY_ID, CHECK_IN_REQUEST_CAPABILITY_ID, CALENDAR_MANAGEMENT_CAPABILITY_ID, DEVICE_ACTION_CAPABILITY_ID, LOCAL_DATA_LIBRARY_CAPABILITY_ID, MEMORY_WRITE_CAPABILITY_ID, MUSIC_CONTROL_CAPABILITY_ID, NOTE_WALL_CAPABILITY_ID, PHOTO_WALL_CAPABILITY_ID, PERCEPTION_READ_CAPABILITY_ID, PHONE_WIDGET_CAPABILITY_ID, REALITY_BRIDGE_CAPABILITY_ID, SEND_FILE_CAPABILITY_ID, SYSTEM_CALENDAR_CAPABILITY_ID, TIMED_WAKE_CAPABILITY_ID, TOOLBOX_MANAGEMENT_CAPABILITY_ID, getInternalCapability } from "./internal-capability-storage";
+import { createPhotoWallId, loadPhotoWallState, savePhotoWallState, type PhotoWallDoodle, type PhotoWallCreationRecord, type PhotoWallPhoto } from "./photo-wall-storage";
+import { generateImageFromConfiguredApi } from "./image-generation-service";
+import {
+    checkQueryCooldown,
+    describeStatusByFocus,
+    filterStatusBySwitches,
+    hasPerceptionBridge,
+    loadPerceptionConfig,
+    loadPerceptionStatus,
+    markQueryPerformed,
+} from "./perception";
+import { notifyDeviceAction, runDeviceAction } from "./device-action";
+import { renderWidgetHtml, injectWidgetCss } from "./widget/template";
+import { canGenerateAvatar, generateWidgetAvatar } from "./widget/avatar";
+import { loadWidgetConfig, saveWidgetData, loadWidgetData, loadWidgetProfiles, loadWidgetProfileData, saveWidgetProfileData } from "./widget/storage";
+import { pushWidgetProfileHtml } from "./widget/bridge";
+import type { WidgetData } from "./widget/types";
+import { syncWidgetToNative } from "./widget/bridge";
+import {
+    formatEventTime,
+    hasCalendarBridge,
+    hasCalendarReadPermission,
+    hasCalendarWritePermission,
+    insertSystemCalendarEvent,
+    loadSystemCalendarConfig,
+    readSystemCalendarEvents,
+} from "./system-calendar";
 import { bridgeConnection, loadBridgeDataItems, loadBridgeShortcutActions, readAllBridgeStateSnapshots, readBridgeStateSnapshot } from "./reality-bridge/storage";
 import { createShortcutCommand, deliverShortcutCommand, waitForShortcutCommand } from "./shortcut-command-client";
 import { loadMemoryEntriesByType, saveMemoryEntry } from "./memory-storage";
@@ -440,7 +469,52 @@ export function parseToolCalls(text: string): { cleanText: string; toolCalls: To
 
 export async function executeToolCalls(toolCalls: ToolCall[], context?: ToolExecutionContext): Promise<ToolResult[]> {
     throwIfAborted(context?.signal);
-    return Promise.all(toolCalls.map(call => executeSingleToolCall(call, context, { depth: 0 })));
+    // Life tools read and write one shared snapshot. Serialize those calls to prevent
+    // concurrent invitations/schedule changes from overwriting one another, while keeping
+    // independent non-life tools parallel. Results stay aligned with the model's call order.
+    const results = new Array<ToolResult>(toolCalls.length);
+    const independentCalls = toolCalls
+        .map((call, index) => ({ call, index }))
+        .filter(item => !item.call.name.startsWith("life_"));
+    await Promise.all(independentCalls.map(async ({ call, index }) => {
+        throwIfAborted(context?.signal);
+        results[index] = await executeSingleToolCall(call, context, { depth: 0 });
+    }));
+    for (let index = 0; index < toolCalls.length; index++) {
+        const call = toolCalls[index];
+        if (!call.name.startsWith("life_")) continue;
+        throwIfAborted(context?.signal);
+        results[index] = await executeSingleToolCall(call, context, { depth: 0 });
+    }
+    if ((context?.appId === "chat" || context?.appId === "group_chat") && context.characterId && typeof window !== "undefined") {
+        try {
+            let life = loadVirtualLifeState();
+            if (life.settings.enabled) {
+                const characterName = loadCharacters().find(character => character.id === context.characterId)?.name ?? "角色";
+                let changed = false;
+                for (let index = 0; index < toolCalls.length; index++) {
+                    const call = toolCalls[index];
+                    if (call.name.startsWith("life_")) continue; // Life tools record their own richer event.
+                    const result = results[index];
+                    const detail = result?.success === false
+                        ? "调用未成功：" + (result.error || "工具返回失败")
+                        : "角色在消息互动中执行了该工具。";
+                    life = appendLifeTimelineEntry(life, {
+                        category: "tool",
+                        title: characterName + "调用了" + call.name + "工具",
+                        details: detail,
+                        actorId: context.characterId,
+                        actorName: characterName,
+                    });
+                    changed = true;
+                }
+                if (changed) saveVirtualLifeState(life);
+            }
+        } catch {
+            // Tool execution must not fail because optional Life timeline logging failed.
+        }
+    }
+    return results;
 }
 
 type ToolExecutionHint = {
@@ -519,6 +593,12 @@ async function executeSingleToolCall(
         return null;
     };
     const tryCustomApp = () => executeCustomAppToolCall(call, context, nameMacroContext);
+    const tryLife = () => executeLifeToolCall(call, context);
+
+    if (call.name.startsWith("life_")) {
+        const lifeResult = await tryLife();
+        if (lifeResult) return lifeResult;
+    }
 
     if (preferredType === "internal") {
         const result = await tryInternal();
@@ -784,12 +864,23 @@ function normalizeInternalToolResult(result: ToolResult): ToolResult {
 
 async function executeInternalTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult | null> {
     if (isNoteWallToolName(call.name)) return executeNoteWallTool(call, context);
+    if (isPhotoWallToolName(call.name)) return executePhotoWallTool(call, context);
     if (isMusicControlToolName(call.name)) return executeMusicControlTool(call, context);
     if (isCalendarToolName(call.name)) return executeCalendarTool(call, context);
     if (isLocalDataToolName(call.name)) return executeLocalDataTool(call);
     if (isToolboxManagementToolName(call.name)) return executeToolboxManagementTool(call);
     if (call.name === "发送文件") return executeSendFileTool(call);
     if (call.name === "角色电脑") return executeAgentComputerTool(call, context);
+    // 内置工具必须排在用户自定义的现实桥动作**之前**：
+    // 用户完全可能把快捷动作也命名成「查看手机状态」，若让现实桥先匹配，
+    // 内置工具就永远调不到（被同名的用户动作影子覆盖），而且表现是
+    // 「调了但行为不对」——极难排查。宁可让用户起名时就被拦住（见现实桥的保留名校验）。
+    if (call.name === "查看手机状态") return executePerceptionReadTool(call, context);
+    if (call.name === "操作手机设备") return executeDeviceActionTool(call, context);
+    if (call.name === "查看系统日程") return executeSystemCalendarReadTool(call);
+    if (call.name === "写入系统日历") return executeSystemCalendarWriteTool(call);
+    if (call.name === "在桌面留句话") return executePhoneWidgetTool(call, context);
+    if (call.name === "请求看屏幕") return executeCheckInRequestTool(call, context);
     if (isRealityBridgeToolName(call.name)) return executeRealityBridgeTool(call, context);
     if (call.name === "稍后主动联系" || call.name === "设置定时醒来") return executeTimedWakeTool(call, context);
 
@@ -808,6 +899,444 @@ async function executeInternalTool(call: ToolCall, context?: ToolExecutionContex
     }
 
     return executeMemoryWriteTool(call.args, capability, context);
+}
+
+/**
+ * 角色主动请求看一眼用户屏幕。
+ *
+ * 与「查看手机状态」的分工：那个读电量/网络这类状态数据、不打扰用户；
+ * 这个会在用户屏幕上**弹一个确认框**，是打扰性动作，必须用户当场点头才看得到。
+ * 所以用户没开启查岗能力时角色完全看不到这个工具。
+ */
+async function executeCheckInRequestTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const capability = getInternalCapability(CHECK_IN_REQUEST_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return {
+            name: call.name,
+            success: false,
+            error: "「请求看屏幕」能力未启用（工具箱 → 内置能力）",
+            continueConversation: false,
+            persistToHistory: false,
+            userNotice: "看屏幕能力未启用",
+        };
+    }
+    if (!context?.characterId) {
+        return { name: call.name, success: false, error: "这个动作需要在角色会话里使用" };
+    }
+
+    try {
+        // 动态引入：截屏模块牵到聊天与追问服务，静态引入容易与这里成环。
+        const { requestCheckInForTool } = await import("./screenshot");
+        const outcome = await requestCheckInForTool(context.characterId);
+        return {
+            name: call.name,
+            success: outcome.ok,
+            // 两种情况都要把话交回给模型：成功的要它接着点评，
+            // 被拒/失败的要它自然接话——所以都走 data，而不是把拒绝当 error 让它重试。
+            data: outcome.message,
+            ...(outcome.accepted ? { userNotice: "看了看你的屏幕" } : {}),
+        };
+    } catch (err) {
+        return {
+            name: call.name,
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+        };
+    }
+}
+
+/**
+ * 角色在用户桌面小组件里留一句话。
+ *
+ * 与「往聊天里发消息」的关键差别：用户**不用打开 App** 就能看到，
+ * 所以措辞要像随手写下的状态，而不是打招呼。
+ * 落款用角色名，头像沿用上一次的（生图很慢，不在这个动作里做）。
+ */
+async function executePhoneWidgetTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const capability = getInternalCapability(PHONE_WIDGET_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return {
+            name: call.name,
+            success: false,
+            error: "「在桌面留句话」能力未启用（工具箱 → 内置能力）",
+            continueConversation: false,
+            persistToHistory: false,
+            userNotice: "桌面留话能力未启用",
+        };
+    }
+    if (!context?.characterId) {
+        return { name: call.name, success: false, error: "这个动作需要在角色会话里使用" };
+    }
+    const config = loadWidgetConfig();
+    if (!config.enabled) {
+        return {
+            name: call.name,
+            success: false,
+            error: "TA 还没有开启桌面小组件（设置 → 桌面小组件）",
+        };
+    }
+
+    // 参数健壮化：模型偶尔会把 text 包进代码围栏/引号，或用 content/message 传参——
+    // 都接住并清理，不要一遇到就「需要 text 参数」报错。
+    const rawText = String(call.args?.text ?? call.args?.content ?? call.args?.message ?? "");
+    const text = rawText
+        .replace(/^```(?:json|text|markdown)?\s*/i, "")
+        .replace(/```\s*$/i, "")
+        .trim()
+        .replace(/^["「『“]|["」』”]$/g, "")
+        .slice(0, 300);
+    if (!text) return { name: call.name, success: false, error: "需要 text 参数：要留在桌面上的那句话（60 字内效果最好）" };
+    const status = String(call.args?.status ?? "").replace(/^["「『“]|["」』”]$/g, "").trim().slice(0, 30);
+    // 可选：指定写入哪个桌面实例（设置 → 桌面小组件里创建的独立配置）。
+    // 不传时写默认实例——多实例用户可以让不同小组件显示不同角色/不同内容。
+    const profileId = String(call.args?.profileId ?? call.args?.instance ?? "").trim();
+
+    const character = loadCharacters().find(item => item.id === context.characterId);
+    const userName = resolveUserIdentity(context.characterId, context.appId)?.name || "用户";
+
+    // 配了生图且用户开了开关时，顺带换一张配当前状态的头像。
+    // 失败/没配都静默沿用旧头像——不能因为头像让「留话」整体失败。
+    const previousData = profileId ? loadWidgetProfileData(profileId) ?? loadWidgetData() : loadWidgetData();
+    let avatar = previousData?.avatar ?? "";
+    if (config.useGeneratedAvatar && canGenerateAvatar() && character) {
+        const generated = await generateWidgetAvatar(character, status, text, context.signal);
+        if (generated) avatar = generated;
+    }
+
+    const widgetData: WidgetData = {
+        characterId: context.characterId,
+        text,
+        status,
+        avatar,
+        updatedAt: new Date().toISOString(),
+        source: "tool",
+    };
+
+    try {
+        if (profileId) {
+            const profile = loadWidgetProfiles().find(item => item.id === profileId);
+            if (!profile) {
+                return { name: call.name, success: false, error: `没有找到桌面实例 ${profileId}；可在设置 → 桌面小组件查看已有实例 ID` };
+            }
+            saveWidgetProfileData(profileId, widgetData);
+            const html = injectWidgetCss(
+                renderWidgetHtml(profile.template, loadWidgetProfileData(profileId)!, character?.name ?? "角色", userName),
+                profile.customCss,
+            );
+            const pushed = pushWidgetProfileHtml(profileId, html, { widthDp: profile.widthDp, heightDp: profile.heightDp, scale: profile.scale });
+            if (!pushed) console.warn("[Widget] 推送独立实例失败（可能是旧壳），内容已保存");
+            return {
+                name: call.name,
+                success: true,
+                data: pushed
+                    ? "已在桌面实例「" + profile.name + "」留下：「" + text + "」" + (status ? "（状态：" + status + "）" : "")
+                    : "内容已保存到桌面实例「" + profile.name + "」，但原生桌面未确认刷新；请检查小组件壳版本或重新打开设置页同步。",
+                userNotice: pushed ? "已在桌面实例上留了句话" : "留言已保存，但桌面尚未确认刷新",
+            };
+        }
+
+        saveWidgetData(widgetData);
+
+        // 立刻推给桌面。没装壳/老壳时这一步失败也无所谓——
+        // 内容已经存下了，用户下次打开设置页会看到，装壳后自然同步过去。
+        let pushed = false;
+        try {
+            const html = renderWidgetHtml(config.customTemplate, loadWidgetData()!, character?.name ?? "角色", userName);
+            pushed = syncWidgetToNative(html);
+        } catch (err) {
+            console.warn("[Widget] 推送原生失败", err);
+        }
+
+        return {
+            name: call.name,
+            success: true,
+            data: pushed
+                ? "已在 TA 的桌面上留下：「" + text + "」" + (status ? "（状态：" + status + "）" : "")
+                : "内容已保存，但原生桌面未确认刷新；请检查小组件是否已添加、安卓壳版本是否支持，并重新打开设置页同步。",
+            userNotice: pushed ? "已在桌面上留了句话" : "留言已保存，但桌面尚未确认刷新",
+        };
+    } catch (err) {
+        return { name: call.name, success: false, error: err instanceof Error ? err.message : "桌面留话失败" };
+    }
+}
+
+/** 角色查看用户真实手机的系统日历（只读，且只读摘要字段）。 */
+async function executeSystemCalendarReadTool(call: ToolCall): Promise<ToolResult> {
+    const capability = getInternalCapability(SYSTEM_CALENDAR_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return {
+            name: call.name,
+            success: false,
+            error: "「系统日历」能力未启用（工具箱 → 内置能力）",
+            continueConversation: false,
+            persistToHistory: false,
+            userNotice: "系统日历能力未启用",
+        };
+    }
+    if (!hasCalendarBridge()) {
+        return { name: call.name, success: false, error: "当前 App 版本不支持读日历，需要更新安卓壳" };
+    }
+    // 两道都要过：用户在面板里打开的开关（意图）与系统授予的权限（能力）。
+    // 只查权限不够——用户可能授权后又在面板里关掉了，那就不该再读。
+    if (!loadSystemCalendarConfig().readEnabled) {
+        return {
+            name: call.name,
+            success: false,
+            error: "TA 还没有开启「读取日程」（设置 → 系统日历）",
+        };
+    }
+    if (!hasCalendarReadPermission()) {
+        return {
+            name: call.name,
+            success: false,
+            error: "还没有读取日历的权限，需要 TA 去设置里授权",
+        };
+    }
+
+    const daysAhead = Number(call.args?.daysAhead);
+    const daysBack = Number(call.args?.daysBack);
+    const events = readSystemCalendarEvents(
+        Number.isFinite(daysAhead) ? Math.max(1, Math.min(60, Math.round(daysAhead))) : 7,
+        Number.isFinite(daysBack) ? Math.max(0, Math.min(60, Math.round(daysBack))) : 0,
+    );
+    if (events.length === 0) {
+        // 空是正常结果，不是错误：说「没安排」比说「读取失败」准确
+        return { name: call.name, success: true, data: "这段时间 TA 的日历里没有安排。" };
+    }
+    const lines = events.map(event => {
+        const when = formatEventTime(event);
+        const place = event.location ? ` @ ${event.location}` : "";
+        return `- ${when} ${event.title}${place}`;
+    });
+    return {
+        name: call.name,
+        success: true,
+        data: `TA 的日程（共 ${events.length} 条）：\n${lines.join("\n")}`,
+        userNotice: "看了看你的日程",
+    };
+}
+
+/** 角色把一个重要日子写进用户系统日历。只新增，绝不改删用户已有安排。 */
+async function executeSystemCalendarWriteTool(call: ToolCall): Promise<ToolResult> {
+    const capability = getInternalCapability(SYSTEM_CALENDAR_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return {
+            name: call.name,
+            success: false,
+            error: "「系统日历」能力未启用（工具箱 → 内置能力）",
+            continueConversation: false,
+            persistToHistory: false,
+            userNotice: "系统日历能力未启用",
+        };
+    }
+    if (!hasCalendarBridge()) {
+        return { name: call.name, success: false, error: "当前 App 版本不支持写日历，需要更新安卓壳" };
+    }
+    if (!loadSystemCalendarConfig().writeEnabled) {
+        return {
+            name: call.name,
+            success: false,
+            error: "TA 还没有开启「写入日程」（设置 → 系统日历）",
+        };
+    }
+    if (!hasCalendarWritePermission()) {
+        return {
+            name: call.name,
+            success: false,
+            error: "还没有写入日历的权限，需要 TA 去设置里授权",
+        };
+    }
+
+    const title = String(call.args?.title ?? "").trim();
+    const date = String(call.args?.date ?? "").trim();
+    if (!title || !date) {
+        return { name: call.name, success: false, error: "需要 title 和 date 参数" };
+    }
+    const parsed = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+    if (!parsed) {
+        return { name: call.name, success: false, error: "date 需要是 YYYY-MM-DD 格式" };
+    }
+    const year = Number(parsed[1]);
+    const month = Number(parsed[2]);
+    const day = Number(parsed[3]);
+    if (month < 1 || month > 12 || day < 1 || day > 31) {
+        return { name: call.name, success: false, error: "日期不合法" };
+    }
+
+    const startTime = String(call.args?.startTime ?? "").trim();
+    const endTime = String(call.args?.endTime ?? "").trim();
+    const note = String(call.args?.note ?? "").trim();
+
+    // 时段事件：起止都给了才当时段，否则按全天。
+    // 只给一个时间会让原生侧拿到 0 作为 DTSTART（1970 年），必须在这里拦住。
+    let allDay = true;
+    let startMillis = 0;
+    let endMillis = 0;
+    const timePattern = /^(\d{1,2}):(\d{2})$/;
+    if (startTime) {
+        const startMatch = timePattern.exec(startTime);
+        const endMatch = endTime ? timePattern.exec(endTime) : null;
+        if (!startMatch || !endMatch) {
+            return {
+                name: call.name,
+                success: false,
+                error: "开始和结束时间要一起给，格式 HH:MM",
+            };
+        }
+        const startDate = new Date(year, month - 1, day, Number(startMatch[1]), Number(startMatch[2]));
+        const endDate = new Date(year, month - 1, day, Number(endMatch[1]), Number(endMatch[2]));
+        if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+            return { name: call.name, success: false, error: "时间不合法" };
+        }
+        if (endDate.getTime() <= startDate.getTime()) {
+            return { name: call.name, success: false, error: "结束时间必须晚于开始时间" };
+        }
+        allDay = false;
+        startMillis = startDate.getTime();
+        endMillis = endDate.getTime();
+    }
+
+    const result = insertSystemCalendarEvent({
+        title,
+        allDay,
+        year,
+        month,
+        day,
+        startMillis,
+        endMillis,
+        description: note,
+    });
+    if (!result.ok) {
+        return {
+            name: call.name,
+            success: false,
+            error: result.needPermission ? "还没有写入日历的权限，需要 TA 去设置里授权" : result.reason,
+            userNotice: "没能写进日历",
+        };
+    }
+    const whenText = allDay ? date : `${date} ${startTime}-${endTime}`;
+    return {
+        name: call.name,
+        success: true,
+        data: `已写进 TA 的系统日历：${whenText}「${title}」，到点系统会提醒 TA。`,
+        userNotice: `已把「${title}」记进 TA 的日历`,
+    };
+}
+
+/** 角色主动「看一眼」真实手机。只读，绝不改变用户设备上的任何东西。 */
+async function executePerceptionReadTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const capability = getInternalCapability(PERCEPTION_READ_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return {
+            name: call.name,
+            success: false,
+            error: "「查看手机状态」能力未启用（工具箱 → 内置能力）",
+            continueConversation: false,
+            persistToHistory: false,
+            userNotice: "查看手机状态能力未启用",
+        };
+    }
+
+    const config = loadPerceptionConfig();
+    if (!config.enabled) {
+        return { name: call.name, success: false, error: "感知功能未开启（现实桥 → 感应）" };
+    }
+
+    const characterId = context?.characterId || "";
+    const cooldown = checkQueryCooldown(characterId);
+    if (!cooldown.allowed) {
+        // 冷却拦下不报错，而是明确告诉角色「刚看过」——否则模型会以为自己没调用成功、
+        // 立刻重试一次，反而更浪费。剩几秒是让它知道该等多久。
+        return {
+            name: call.name,
+            success: true,
+            data: `你刚刚已经看过 TA 的手机了（${cooldown.remainingSeconds} 秒内不必再看）。`
+                + "用你上次看到的信息继续就好，不要连查。",
+        };
+    }
+
+    const status = loadPerceptionStatus();
+    if (!status.at) {
+        return {
+            name: call.name,
+            success: false,
+            error: hasPerceptionBridge()
+                ? "还没采集到手机状态，稍后再试。"
+                : "当前环境读不到真实手机状态（需要在安卓 App 内，且壳版本支持）。",
+        };
+    }
+
+    const focus = typeof call.args?.focus === "string" ? call.args.focus : "";
+    const text = describeStatusByFocus(filterStatusBySwitches(status, config), focus);
+    if (!text) {
+        return { name: call.name, success: true, data: "现在读不到具体信息（可能相关能力被关掉了）。" };
+    }
+    markQueryPerformed(characterId);
+    return { name: call.name, success: true, data: text, userNotice: "看了看你的手机" };
+}
+
+/**
+ * 角色操作真实设备（手电筒 / 音量 / 亮度 / 勿扰 / 打开应用）。
+ *
+ * 与感知读取相反：这个**会真的改变用户手机状态**，所以：
+ *  - 每个动作都要过逐动作开关（用户在设置里能单独关掉不想要的）；
+ *  - 失败必须把原因如实交回给角色，让它转述，而不是笼统报「执行失败」；
+ *  - 成功也回一句人话，角色才知道到底做了什么（亮度调到几、音量现在多大）。
+ */
+async function executeDeviceActionTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const capability = getInternalCapability(DEVICE_ACTION_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return {
+            name: call.name,
+            success: false,
+            error: "「操作手机设备」能力未启用（工具箱 → 内置能力）",
+            continueConversation: false,
+            persistToHistory: false,
+            userNotice: "操作手机设备能力未启用",
+        };
+    }
+
+    const outcome = runDeviceAction(call.args || {});
+    if (!outcome.ok) {
+        // 失败也 persistToHistory=false：不让一条失败的尝试留在历史里
+        // 诱导模型下一轮继续纠结同一个动作。
+        //
+        // 失败**不**发系统通知：设备上什么都没变，弹一条「操作失败」只会打扰用户。
+        // 原因交回角色，由它在对话里自然带一句。
+        return {
+            name: call.name,
+            success: false,
+            error: outcome.reason || "设备动作执行失败",
+            userNotice: outcome.reason || "设备动作执行失败",
+        };
+    }
+
+    // 反馈：成功了才通知。userNotice 只会在聊天室里落一条 [执行动作] 消息，
+    // 用户在小手机桌面或 App 后台时完全看不到——那正是「神戳戳」。
+    // notifyDeviceAction 走的是与角色发消息同一条链路（desktop-shell 统一判断
+    // 「是否正在看这个会话」，不是才弹系统通知），所以免打扰规则天然一致。
+    try {
+        const character = context?.characterId
+            ? loadCharacters().find(c => c.id === context.characterId)
+            : undefined;
+        notifyDeviceAction({
+            sessionId: context?.sessionId,
+            characterName: character?.name,
+            avatar: character?.avatar ?? null,
+            message: outcome.message || "已执行",
+            action: outcome.action || "",
+        });
+    } catch (err) {
+        // 通知失败绝不能影响动作本身——动作已经真的发生了。
+        console.warn("[设备动作] 反馈通知失败", err);
+    }
+
+    return {
+        name: call.name,
+        success: true,
+        data: outcome.message || "已执行",
+        userNotice: outcome.message || "已执行",
+    };
 }
 
 function isRealityBridgeToolName(name: string): boolean {
@@ -1011,6 +1540,10 @@ function isNoteWallToolName(name: string): boolean {
         || name === "查看便签详情及评论"
         || name === "发送便签"
         || name === "发送便签评论";
+}
+
+function isPhotoWallToolName(name: string): boolean {
+    return name === "查看照片墙" || name === "添加照片到照片墙" || name === "在照片墙涂鸦";
 }
 
 function isMusicControlToolName(name: string): boolean {
@@ -1829,6 +2362,117 @@ async function executeNoteWallTool(call: ToolCall, context?: ToolExecutionContex
         persistToHistory: false,
         userNotice: "未知便签墙动作",
     };
+}
+
+async function executePhotoWallTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const capability = getInternalCapability(PHOTO_WALL_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return { name: call.name, success: false, error: "照片墙能力未启用（工具箱 → 内置能力）", continueConversation: false, persistToHistory: false, userNotice: "照片墙能力未启用" };
+    }
+    if (!isSupportedChatToolContext(context)) {
+        return { name: call.name, success: false, error: "照片墙角色工具仅在私聊或群聊中可用", continueConversation: false, persistToHistory: false };
+    }
+    const character = loadCharacters().find(item => item.id === context.characterId);
+    if (!character) return { name: call.name, success: false, error: "找不到当前角色档案。" };
+    try {
+        const state = loadPhotoWallState();
+        if (call.name === "查看照片墙") {
+            const rawLimit = Number(call.args?.limit);
+            const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(5, Math.floor(rawLimit))) : 3;
+            const visible = state.photos.filter(photo => photo.shareWithCharacters === true)
+                .sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit);
+            if (!visible.length) return { name: call.name, success: true, data: "照片墙目前没有用户共享给角色查看的照片。不要读取未共享的私人照片。" };
+            return {
+                name: call.name,
+                success: true,
+                data: "以下是用户明确共享给角色查看的照片。图片附件按顺序对应照片 ID；请基于真实图像描述，不要只根据标题臆测：\n"
+                    + visible.map((photo, index) => `[${index + 1}] photoId=${photo.id}；标题=${photo.title || "未命名"}；说明=${photo.caption || "无"}；类型=${photo.kind}；背面留言=${photo.backNote || "无"}`).join("\n"),
+                mediaAttachments: visible.slice(0, 3).map(photo => ({ type: "image" as const, url: photo.mediaRef, title: photo.title || "照片墙共享照片" })),
+            };
+        }
+        if (call.name === "添加照片到照片墙") {
+            const description = String(call.args?.description ?? "").trim().slice(0, 1200);
+            if (description.length < 5) return { name: call.name, success: false, error: "请提供至少 5 个字符的具体画面描述。" };
+            const rawKind = String(call.args?.kind ?? "moment");
+            const kinds = ["favorite", "selfie", "candid", "scenery", "object", "moment"] as const;
+            const kind = (kinds as readonly string[]).includes(rawKind) ? rawKind as PhotoWallPhoto["kind"] : "moment";
+            const result = await generateImageFromConfiguredApi({ description, characterId: character.id, appId: "photo_wall", participantIds: [character.id] });
+            if (!result?.mediaRef) throw new Error("生图服务没有返回图片，请检查图像生成 API 配置。");
+            const createdAt = new Date().toISOString();
+            const photo: PhotoWallPhoto = {
+                id: createPhotoWallId(), mediaRef: result.mediaRef, createdAt, ownerType: "character",
+                ownerId: character.id, ownerName: character.name, kind,
+                title: String(call.args?.title ?? "").trim().slice(0, 80) || (character.name + "留下的照片"),
+                caption: String(call.args?.caption ?? "").trim().slice(0, 300) || "由角色主动添加到照片墙的生活照片。",
+                backNote: "", tags: [kind], annotations: [], shareWithCharacters: true,
+                generationPrompt: result.prompt, source: "generated",
+            };
+            const record: PhotoWallCreationRecord = {
+                id: createPhotoWallId(), createdAt, authorType: "character", authorId: character.id,
+                authorName: character.name, narrative: character.name + "主动生成并添加了一张照片到共同照片墙。",
+                photoIds: [photo.id], layers: [], doodles: [],
+            };
+            savePhotoWallState({ ...state, photos: [...state.photos, photo], creationRecords: [...(state.creationRecords ?? []), record] });
+            return { name: call.name, success: true, data: character.name + "已把新照片「" + photo.title + "」添加到照片墙。", mediaAttachments: [{ type: "image", url: photo.mediaRef, title: photo.title }], userNotice: character.name + "添加了一张照片到照片墙" };
+        }
+        if (call.name === "在照片墙涂鸦") {
+            const target = call.args?.target === "wall" ? "wall" : "photo";
+            const photoId = String(call.args?.photoId ?? "").trim();
+            const photo = target === "photo"
+                ? state.photos.find(item => item.id === photoId && item.shareWithCharacters === true)
+                : undefined;
+            if (target === "photo" && !photo) return { name: call.name, success: false, error: "找不到该照片，或该照片没有共享给角色。请先调用「查看照片墙」获取可用 photoId；若要在公共画布创作，请设置 target=wall。" };
+            const kind = call.args?.kind === "stroke" ? "stroke" : call.args?.kind === "sticker" ? "sticker" : "";
+            const pointsRaw = call.args?.points;
+            if (!kind || !Array.isArray(pointsRaw)) return { name: call.name, success: false, error: "需要 kind 和 points 参数。" };
+            const points = pointsRaw.slice(0, 80).map((point: unknown) => {
+                if (!point || typeof point !== "object") return null;
+                const x = Number((point as { x?: unknown }).x), y = Number((point as { y?: unknown }).y);
+                return Number.isFinite(x) && Number.isFinite(y) && x >= 0 && x <= 1 && y >= 0 && y <= 1 ? { x, y } : null;
+            });
+            if (points.some(point => point === null) || points.length < (kind === "stroke" ? 2 : 1)) return { name: call.name, success: false, error: kind === "stroke" ? "笔迹至少需要 2 个有效的 0-1 坐标点。" : "贴纸需要 1 个有效的 0-1 坐标点。" };
+            const color = String(call.args?.color ?? "#c2705a");
+            if (!/^#[0-9a-f]{3,8}$/i.test(color)) return { name: call.name, success: false, error: "颜色必须是十六进制颜色值。" };
+            const side = call.args?.side === "back" ? "back" : "front";
+            const doodle: PhotoWallDoodle = {
+                id: createPhotoWallId(), kind, content: kind === "sticker" ? String(call.args?.content ?? "✦").slice(0, 12) : undefined,
+                rotation: Math.max(-45, Math.min(45, Number(call.args?.rotation) || 0)),
+                authorType: "character", authorId: character.id, authorName: character.name,
+                color, width: Math.max(1, Math.min(12, Number(call.args?.width) || 4)),
+                points: points as Array<{ x: number; y: number }>, createdAt: new Date().toISOString(),
+            };
+            const createdAt = new Date().toISOString();
+            if (target === "wall") {
+                const record: PhotoWallCreationRecord = {
+                    id: createPhotoWallId(), createdAt, authorType: "character", authorId: character.id,
+                    authorName: character.name,
+                    narrative: character.name + "在照片墙公共画布上留下了新的涂鸦。",
+                    photoIds: [], layers: [{ kind: "wall", doodles: [doodle] }], doodles: [doodle],
+                };
+                savePhotoWallState({ ...state, wallDoodles: [...(state.wallDoodles ?? []), doodle], creationRecords: [...(state.creationRecords ?? []), record] });
+                return { name: call.name, success: true, data: character.name + "已在照片墙公共画布上追加了一笔涂鸦，原有内容没有被覆盖。", userNotice: character.name + "在照片墙留下了涂鸦" };
+            }
+            const nextPhoto = side === "back"
+                ? { ...photo!, backDoodles: [...(photo!.backDoodles ?? []), doodle] }
+                : { ...photo!, doodles: [...(photo!.doodles ?? []), doodle] };
+            const record: PhotoWallCreationRecord = {
+                id: createPhotoWallId(), createdAt, authorType: "character", authorId: character.id,
+                authorName: character.name,
+                narrative: character.name + "在「" + (photo!.title || "这张照片") + "」的" + (side === "back" ? "背面留言纸" : "正面相框") + "留下了新的涂鸦。",
+                photoIds: [photo!.id], layers: [{ kind: "photo", photoId: photo!.id, side, doodles: [doodle] }], doodles: [doodle],
+            };
+            savePhotoWallState({
+                ...state,
+                photos: state.photos.map(item => item.id === photo!.id ? nextPhoto : item),
+                creationRecords: [...(state.creationRecords ?? []), record],
+            });
+            return { name: call.name, success: true, data: character.name + "已在「" + (photo!.title || "这张照片") + "」" + (side === "back" ? "背面" : "正面") + "追加了一笔涂鸦，原有内容没有被覆盖。", userNotice: character.name + "在照片墙留下了涂鸦" };
+        }
+        return { name: call.name, success: false, error: "未知照片墙动作。" };
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { name: call.name, success: false, error: message, continueConversation: false, persistToHistory: false, userNotice: call.name + "失败：" + message };
+    }
 }
 
 async function executeMusicControlTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {

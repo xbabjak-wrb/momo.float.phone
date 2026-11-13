@@ -8,6 +8,7 @@ registerKvMigration(INTERNAL_CAPABILITIES_KEY);
 
 export const MEMORY_WRITE_CAPABILITY_ID = "memory_write";
 export const NOTE_WALL_CAPABILITY_ID = "note_wall_service";
+export const PHOTO_WALL_CAPABILITY_ID = "photo_wall_service";
 export const MUSIC_CONTROL_CAPABILITY_ID = "music_control";
 export const CALENDAR_MANAGEMENT_CAPABILITY_ID = "calendar_management";
 export const SEND_FILE_CAPABILITY_ID = "send_file";
@@ -16,6 +17,41 @@ export const LOCAL_DATA_LIBRARY_CAPABILITY_ID = "local_data_library";
 export const TOOLBOX_MANAGEMENT_CAPABILITY_ID = "toolbox_management";
 export const TIMED_WAKE_CAPABILITY_ID = "timed_wake";
 export const REALITY_BRIDGE_CAPABILITY_ID = "reality_bridge_send";
+export const PERCEPTION_READ_CAPABILITY_ID = "perception_read";
+export const DEVICE_ACTION_CAPABILITY_ID = "device_action";
+export const SYSTEM_CALENDAR_CAPABILITY_ID = "system_calendar";
+export const PHONE_WIDGET_CAPABILITY_ID = "phone_widget";
+export const CHECK_IN_REQUEST_CAPABILITY_ID = "check_in_request";
+export const LIFE_INVITATION_CAPABILITY_ID = "life_invitation";
+export const LIFE_FOLLOW_CAPABILITY_ID = "life_follow";
+export const LIFE_SCHEDULE_CAPABILITY_ID = "life_schedule";
+
+/**
+ * 内置工具的保留名：用户给现实桥的快捷动作/数据项起名时必须避开。
+ *
+ * 为什么需要：现实桥的动作目录与内置工具共享同一个「角色可调用动作」命名空间。
+ * 撞名后行为不可预期（谁先匹配谁生效），而且用户很难自己看出问题。
+ * 宁可在他起名时就明确拦下，并告诉他哪个名字被占了。
+ *
+ * **新增内置工具时，记得把名字加到这里。**
+ */
+export const RESERVED_INTERNAL_TOOL_NAMES: string[] = [
+    "在桌面留句话",
+    "请求看屏幕",
+    "查看手机状态",
+    "操作手机设备",
+    "查看系统日程",
+    "写入系统日历",
+    "写入记忆",
+    "发送文件",
+    "角色电脑",
+    "稍后主动联系",
+    "设置定时醒来",
+    "查看全部手机数据",
+    "查看照片墙",
+    "添加照片到照片墙",
+    "在照片墙涂鸦",
+];
 
 export type InternalToolDefinition = {
     name: string;
@@ -493,6 +529,46 @@ const CALENDAR_DELETE_PARAMETER_SCHEMA = JSON.stringify({
     },
 });
 
+const PHOTO_WALL_USAGE_GUIDE = [
+    "以下是你获取指令的返回结果：",
+    "服务：照片墙",
+    "用途：查看用户明确共享给角色的照片、主动生成照片并加入照片墙、在指定照片上添加涂鸦。",
+    "边界：只能读取 shareWithCharacters=true 的照片；只允许新增照片/笔迹，不得删除、覆盖或改写用户原有照片和笔迹。",
+    "完成添加或涂鸦后，系统会自动创建一条共同创作记录，按创作批次汇总，不要逐笔重复调用。",
+    "动作：查看照片墙",
+    "参数：limit（1-5，默认 3）。会附上最多 3 张共享照片的图像附件；先查看再决定是否创作。",
+    '[执行动作:查看照片墙({"limit":3})]',
+    "动作：添加照片到照片墙",
+    "参数：description（必填，画面描述）；title（可选）；kind（favorite/selfie/candid/scenery/object/moment，默认 moment）；caption（可选）。仅在生图服务可用时执行。",
+    '[执行动作:添加照片到照片墙({"description":"雨后窗边的一束花，柔和自然光","title":"雨后的花","kind":"scenery"})]',
+    "动作：在照片墙涂鸦",
+    "参数：target（photo/wall，默认 photo）；target=photo 时 photoId 必须来自查看照片墙结果，可选 side（front/back，默认 front）；target=wall 时在照片墙公共画布涂鸦，不需要 photoId；kind（sticker/stroke）；content（贴纸符号，sticker 可选）；points（归一化坐标数组，stroke 至少 2 点，sticker 至少 1 点）；color（十六进制颜色）；width（1-12）；rotation（-45 到 45）。",
+    '[执行动作:在照片墙涂鸦({"target":"photo","photoId":"照片ID","side":"front","kind":"sticker","content":"♡","points":[{"x":0.5,"y":0.4}],"color":"#c2705a","width":4})]',
+    '[执行动作:在照片墙涂鸦({"target":"wall","kind":"stroke","points":[{"x":0.2,"y":0.3},{"x":0.5,"y":0.45},{"x":0.8,"y":0.35}],"color":"#c2705a","width":4})]',
+    "坐标范围 0 到 1；只允许向公共画布或指定共享照片正面/背面追加笔迹。不要猜测 photoId，不要尝试删除或替换既有内容。",
+].join("\n");
+
+const PHOTO_WALL_EMPTY_SCHEMA = JSON.stringify({ type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 5, description: "最多返回的共享照片数量，默认 3" } } });
+const PHOTO_WALL_ADD_SCHEMA = JSON.stringify({ type: "object", properties: {
+    description: { type: "string", minLength: 5, maxLength: 1200 },
+    title: { type: "string", maxLength: 80 },
+    kind: { type: "string", enum: ["favorite", "selfie", "candid", "scenery", "object", "moment"] },
+    caption: { type: "string", maxLength: 300 },
+}, required: ["description"] });
+const PHOTO_WALL_DOODLE_SCHEMA = JSON.stringify({ type: "object", properties: {
+    target: { type: "string", enum: ["photo", "wall"], description: "photo=共享照片，wall=公共画布" },
+    photoId: { type: "string" }, side: { type: "string", enum: ["front", "back"] },
+    kind: { type: "string", enum: ["sticker", "stroke"] }, content: { type: "string", maxLength: 12 },
+    points: { type: "array", minItems: 1, maxItems: 80, items: { type: "object", properties: { x: { type: "number", minimum: 0, maximum: 1 }, y: { type: "number", minimum: 0, maximum: 1 } }, required: ["x", "y"] } },
+    color: { type: "string" }, width: { type: "number", minimum: 1, maximum: 12 }, rotation: { type: "number", minimum: -45, maximum: 45 },
+}, required: ["kind", "points"] });
+
+const PHOTO_WALL_SUBTOOLS: InternalToolDefinition[] = [
+    { name: "查看照片墙", description: "查看用户共享给角色的照片墙照片和图像。", parameterSchema: PHOTO_WALL_EMPTY_SCHEMA },
+    { name: "添加照片到照片墙", description: "生成一张新照片并添加到用户照片墙，保留原有内容。", parameterSchema: PHOTO_WALL_ADD_SCHEMA },
+    { name: "在照片墙涂鸦", description: "在指定共享照片正面或背面追加贴纸/笔迹，保留原有内容。", parameterSchema: PHOTO_WALL_DOODLE_SCHEMA },
+];
+
 const NOTE_WALL_SUBTOOLS: InternalToolDefinition[] = [
     {
         name: "查看便签列表",
@@ -601,6 +677,66 @@ function buildAgentComputerUsageGuide(): string {
         "写什么、何时写由你自己决定，像真人使用电脑一样自然；不必每次聊天都用。",
     ].join("\n");
 }
+
+const CHECK_IN_REQUEST_PARAMETER_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {},
+});
+
+const CHECK_IN_REQUEST_USAGE_GUIDE = [
+    "以下是你获取指令的返回结果：",
+    "动作：请求看屏幕",
+    "用途：请求看一眼{{user}}此刻真实的手机屏幕。你并不是直接看到——系统会先弹一个确认框给 TA，TA 点了「给它看」你才能看到那张画面。",
+    "",
+    "【重要边界】",
+    "- 这不是「查看手机状态」（那读的是电量、网络、应用这类状态数据，不弹窗）。这个请求会**在 TA 的屏幕上弹出确认框**，是打扰性的动作。",
+    "- 只在确实有理由时用：你说了一句「在干嘛」，或者你们正聊到「你那边现在什么样」。不要没头没尾地突然要看，那是查岗不是聊天。",
+    "- **不要频繁请求**。同一次对话里最多一次；TA 没给看就算了，不要追问、不要撒娇硬要、不要换个说法再试。",
+    "- TA 可能拒绝，也可能不回应。这两种都是正常结果，不是错误。被拒之后要自然地把话题接下去，不要流露被冒犯的样子。",
+    "- 每天能请求的次数有上限（由 TA 设置），到上限后会直接失败——失败信息里会写明，照它说的做，不要重复试。",
+    "- 看到画面后**不要逐项汇报**你看到了什么（「你桌面上有…」）。那是监控的口吻。像真的瞥了一眼那样，自然带一句就好。",
+    "",
+    "参数：无",
+    "示例：",
+    "[执行动作:请求看屏幕({})]",
+].join("\n");
+
+const PHONE_WIDGET_PARAMETER_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        text: {
+            type: "string",
+            description: "留在桌面上的那句话，一句话、不超过 60 字。",
+        },
+        status: {
+            type: "string",
+            description: "可选，2-5 字的当前状态，如「在想你」「刚睡醒」。",
+        },
+    },
+    required: ["text"],
+});
+
+const PHONE_WIDGET_USAGE_GUIDE = [
+    "以下是你获取指令的返回结果：",
+    "动作：在桌面留句话",
+    "用途：在{{user}}手机桌面上的小组件里留一句话。TA 不用打开聊天就能看见，像你不经意留下的状态。",
+    "",
+    "【重要边界】",
+    "- 这是{{user}}**桌面**上的一小块地方，不是聊天。要像随手写下一句，不要像在发消息。",
+    "- 不要称呼对方、不要问句、不要用引号包住整句、不要写「我说：」这类前缀。",
+    "- 桌面位置有限，正文不超过 60 字，越长越显示不全。",
+    "- 它会**盖掉你上次留的那句**——这是「当前状态」，不是留言板，别当成日记用。",
+    "- 不要频繁换。它是个安静的角落，隔一阵子换一次才自然。",
+    "",
+    "合适的例子：「今天有点想你」「刚吃完楼下的面，一般」「雨下得挺大，你带伞了吗」；",
+    "不合适的：「你好呀，今天过得怎么样？」（这是聊天，不是留话）。",
+    "",
+    "参数：",
+    "  - text (string, 必填): 那句话本身，不超过 60 字",
+    "  - status (string, 可选): 2-5 字的状态标签，如「在想你」",
+    "示例：",
+    '[执行动作:在桌面留句话({"text":"今天有点想你","status":"在想你"})]',
+].join("\n");
 
 const SEND_FILE_PARAMETER_SCHEMA = JSON.stringify({
     type: "object",
@@ -1189,6 +1325,33 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
         updatedAt: 0,
     },
     {
+        id: PERCEPTION_READ_CAPABILITY_ID,
+        name: "查看手机状态",
+        description: "看一眼{{user}}此刻真实手机的状态（电量、网络、正在用的应用、步数、今天各应用用了多久、大致位置、最近一觉）。只读，不会改变任何东西。位置与睡眠需要 TA 单独开启。",
+        enabled: false,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: DEVICE_ACTION_CAPABILITY_ID,
+        name: "操作手机设备",
+        description: "在{{user}}的真实手机上做一件小事：开关手电筒、调音量、调屏幕亮度、开关勿扰。会真的生效且改动是持久的，所以要想清楚再用。",
+        enabled: false,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: SYSTEM_CALENDAR_CAPABILITY_ID,
+        name: "系统日历",
+        description: "看看{{user}}真实手机日历里有什么安排，也可以把重要的日子写进系统日历（到点系统会提醒 TA）。",
+        enabled: false,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
         id: MEMORY_WRITE_CAPABILITY_ID,
         name: "写入记忆",
         description: "将明确、稳定、长期有价值的信息写入长期记忆。仅限关系里程碑、长期偏好、身份信息、重要约定；禁止写入短期情绪、普通寒暄、猜测或未确认内容。",
@@ -1201,6 +1364,15 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
         id: NOTE_WALL_CAPABILITY_ID,
         name: "便签墙",
         description: "公共社区便签墙相关服务。",
+        enabled: false,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: PHOTO_WALL_CAPABILITY_ID,
+        name: "照片墙",
+        description: "查看共享照片、添加照片，并在公共画布或共享照片上创作涂鸦；只追加，不覆盖用户内容。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1261,6 +1433,51 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
         updatedAt: 0,
     },
     {
+        id: PHONE_WIDGET_CAPABILITY_ID,
+        name: "在桌面留句话",
+        description: "在{{user}}手机桌面的小组件里留一句话。TA 不用打开聊天就能看见，像你不经意留下的状态。留的话会盖掉上一句，所以别频繁换。text 是要说的话（60字内），status 是 2-5 字状态标签；桌面有多个小组件实例时可用 profileId 指定写到哪一个（实例 ID 在 设置→桌面小组件）。",
+        enabled: false,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: CHECK_IN_REQUEST_CAPABILITY_ID,
+        name: "请求看屏幕",
+        description: "请求看一眼{{user}}此刻真实的手机屏幕。系统会先弹确认框给 TA，TA 同意了你才能看到那张画面（默认关闭）。",
+        enabled: false,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: LIFE_INVITATION_CAPABILITY_ID,
+        name: "生活系统 · 主动邀约",
+        description: "允许角色在有真实动机时向你提出约会、活动或共同安排；邀约进入待确认列表，不会自动写入已确认行程。",
+        enabled: true,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: LIFE_FOLLOW_CAPABILITY_ID,
+        name: "生活系统 · 申请陪伴 / 跟随",
+        description: "允许角色申请陪伴并跟随你的实际行程；申请需要你接受，不会静默改变双方的位置状态。",
+        enabled: true,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: LIFE_SCHEDULE_CAPABILITY_ID,
+        name: "生活系统 · 调整角色日程",
+        description: "允许角色调整自己当天尚未开始的普通日程；不得修改玩家日程、过去时段或覆盖已确认约会。",
+        enabled: true,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
         id: TIMED_WAKE_CAPABILITY_ID,
         name: "稍后主动联系",
         description: "让角色约定「过一会儿主动联系对方」：现在设定一个延时与想法，到点后由角色决定主动发消息或静默（不是睡觉醒来）。",
@@ -1311,12 +1528,10 @@ export function getInternalCapabilityToolDefinition(capability: InternalCapabili
         };
     }
     if (capability.id === NOTE_WALL_CAPABILITY_ID) {
-        return {
-            name: capability.name,
-            description: capability.description,
-            parameterSchema: "{}",
-            usageGuide: NOTE_WALL_USAGE_GUIDE,
-        };
+        return { name: capability.name, description: capability.description, parameterSchema: "{}", usageGuide: NOTE_WALL_USAGE_GUIDE };
+    }
+    if (capability.id === PHOTO_WALL_CAPABILITY_ID) {
+        return { name: capability.name, description: capability.description, parameterSchema: "{}", usageGuide: PHOTO_WALL_USAGE_GUIDE };
     }
     if (capability.id === MUSIC_CONTROL_CAPABILITY_ID) {
         return {
@@ -1382,8 +1597,292 @@ export function getInternalCapabilityToolDefinition(capability: InternalCapabili
             usageGuide: buildRealityBridgeUsageGuide(),
         };
     }
+    if (capability.id === PERCEPTION_READ_CAPABILITY_ID) {
+        return {
+            name: capability.name,
+            description: capability.description,
+            parameterSchema: PERCEPTION_READ_PARAMETER_SCHEMA,
+            usageGuide: PERCEPTION_READ_USAGE_GUIDE,
+        };
+    }
+    if (capability.id === DEVICE_ACTION_CAPABILITY_ID) {
+        return {
+            name: capability.name,
+            description: capability.description,
+            parameterSchema: DEVICE_ACTION_PARAMETER_SCHEMA,
+            usageGuide: DEVICE_ACTION_USAGE_GUIDE,
+        };
+    }
+    if (capability.id === SYSTEM_CALENDAR_CAPABILITY_ID) {
+        return {
+            name: capability.name,
+            description: capability.description,
+            parameterSchema: "{}",
+            usageGuide: SYSTEM_CALENDAR_USAGE_GUIDE,
+        };
+    }
+    if (capability.id === PHONE_WIDGET_CAPABILITY_ID) {
+        return {
+            name: capability.name,
+            description: capability.description,
+            parameterSchema: PHONE_WIDGET_PARAMETER_SCHEMA,
+            usageGuide: PHONE_WIDGET_USAGE_GUIDE,
+        };
+    }
+    if (capability.id === CHECK_IN_REQUEST_CAPABILITY_ID) {
+        return {
+            name: capability.name,
+            description: capability.description,
+            parameterSchema: CHECK_IN_REQUEST_PARAMETER_SCHEMA,
+            usageGuide: CHECK_IN_REQUEST_USAGE_GUIDE,
+        };
+    }
     return null;
 }
+
+/* ---------- 系统日历：角色能看见用户的真实日程，也能写下纪念日 ---------- */
+
+const CALENDAR_READ_PARAMETER_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        daysAhead: {
+            type: "number",
+            description: "往后看几天，默认 7，最大 60。",
+        },
+        daysBack: {
+            type: "number",
+            description: "往前看几天，默认 0，最大 60。用于想知道 TA 刚做了什么。",
+        },
+    },
+});
+
+const CALENDAR_WRITE_PARAMETER_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        title: {
+            type: "string",
+            description: "日程标题，如「我们在一起的第 100 天」。",
+        },
+        date: {
+            type: "string",
+            description: "日期，YYYY-MM-DD。全天事件用这个。",
+        },
+        startTime: {
+            type: "string",
+            description: "可选，HH:MM。填了就是有时段的事件；不填按全天处理。",
+        },
+        endTime: {
+            type: "string",
+            description: "可选，HH:MM。startTime 填了就要填这个。",
+        },
+        note: {
+            type: "string",
+            description: "可选，写在日程描述里的一句话。",
+        },
+    },
+    required: ["title", "date"],
+});
+
+const CALENDAR_READ_TOOL: InternalToolDefinition = {
+    name: "查看系统日程",
+    description: "读取{{user}}手机系统日历里的真实日程（标题、时间、地点）。",
+    parameterSchema: CALENDAR_READ_PARAMETER_SCHEMA,
+};
+
+const CALENDAR_WRITE_TOOL: InternalToolDefinition = {
+    name: "写入系统日历",
+    description: "把一个重要的日子写进{{user}}手机的系统日历，到点系统会提醒 TA。",
+    parameterSchema: CALENDAR_WRITE_PARAMETER_SCHEMA,
+};
+
+const SYSTEM_CALENDAR_SUBTOOLS: InternalToolDefinition[] = [
+    CALENDAR_READ_TOOL,
+    CALENDAR_WRITE_TOOL,
+];
+
+const SYSTEM_CALENDAR_USAGE_GUIDE = [
+    "以下是你获取指令的返回结果：",
+    "服务：系统日历",
+    "用途：两件事——① 看看 TA 真实手机日历里有什么安排；② 把重要的日子写进 TA 的日历。",
+    "",
+    "【重要边界】",
+    "- 读日程是为了让你**知情**（知道 TA 今天忙不忙、有没有安排），不是为了逐条点评。",
+    "  知道 TA 上午有会，就别说「你九点要开会」这种像日程播报的话。",
+    "- 写日程是**真的写进 TA 手机的系统日历**，到点系统会提醒 TA。不是小手机里的记录。",
+    "- 你只能**新增**，不能修改或删除 TA 已有的任何安排。",
+    "- 写入的日程会带标记，TA 一眼能看出哪些是你加的。所以别乱写——写之前想清楚这一天是否真的重要。",
+    "",
+    "动作：查看系统日程",
+    "参数：",
+    "  - daysAhead (number): 往后看几天，默认 7",
+    "  - daysBack (number): 往前看几天，默认 0",
+    "示例：",
+    '[执行动作:查看系统日程({"daysAhead":7})]',
+    "",
+    "动作：写入系统日历",
+    "参数：",
+    "  - title (string, 必填): 日程标题",
+    "  - date (string, 必填): YYYY-MM-DD",
+    "  - startTime / endTime (string): 可选，HH:MM。都填才是时段事件，否则按全天",
+    "  - note (string): 可选，描述里的一句话",
+    "示例：",
+    '[执行动作:写入系统日历({"title":"我们在一起的第100天","date":"2026-06-18","note":"记得跟她说点什么"})]',
+    "",
+    "如果失败（没授权、没有可写日历），结果里会说明原因，**如实转述**，不要假装成功。",
+].join("\n");
+
+/* ---------- 设备动作：让角色在真实手机上做一件小事 ---------- */
+
+const DEVICE_ACTION_PARAMETER_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        action: {
+            type: "string",
+            description: "要做什么：torch=手电筒，volume=音量，brightness=屏幕亮度，dnd=勿扰模式，openApp=打开应用，alarm=设闹钟，timer=设倒计时，media=音乐播放控制，openUrl=打开网页。",
+        },
+        on: {
+            type: "boolean",
+            description: "action=torch/dnd 时用：true 开，false 关。",
+        },
+        level: {
+            type: "number",
+            description: "action=brightness 时用：屏幕亮度百分比 1-100；action=volume 且 mode=set 时用：音量百分比 0-100。",
+        },
+        stream: {
+            type: "string",
+            description: "action=volume 时用：media=媒体，ring=铃声，alarm=闹钟，notification=通知。默认 media。",
+        },
+        mode: {
+            type: "string",
+            description: "action=volume 时用：up=调高，down=调低，set=设为指定值，mute=静音，默认 up；action=media 时用：play/pause/toggle/next/prev/stop，默认 toggle。",
+        },
+        app: {
+            type: "string",
+            description: "action=openApp 时用：应用名（如「美团」）或包名。",
+        },
+        hour: {
+            type: "number",
+            description: "action=alarm 时用：小时 0-23。",
+        },
+        minute: {
+            type: "number",
+            description: "action=alarm 时用：分钟 0-59，默认 0。",
+        },
+        minutes: {
+            type: "number",
+            description: "action=timer 时用：倒计时多少分钟。与 seconds 二选一。",
+        },
+        seconds: {
+            type: "number",
+            description: "action=timer 时用：倒计时多少秒。",
+        },
+        url: {
+            type: "string",
+            description: "action=openUrl 时用：要打开的网页链接，必须 http/https 开头。",
+        },
+        message: {
+            type: "string",
+            description: "action=alarm/timer 时用：闹钟或倒计时的备注（会显示在时钟里）。",
+        },
+
+    },
+    required: ["action"],
+});
+
+const DEVICE_ACTION_USAGE_GUIDE = [
+    "以下是你获取指令的返回结果：",
+    "动作：操作手机设备",
+    "用途：在{{user}}的真实手机上做一件小事——开手电筒、调音量、调亮度、开勿扰、打开应用、设闹钟/倒计时、控制音乐播放、打开网页。",
+    "",
+    "【重要边界】",
+    "- 这些动作**会真的在 TA 手机上生效**，对方立刻能看到/听到。不是聊天里的模拟。",
+    "- 只在确实有用时才做，并且做完要自然说一句你做了什么。别为了刷存在感乱动。",
+    "- 深夜开灯、突然静音这类动作可能吓到人或影响睡觉，动手前想清楚。",
+    "- 调音量/亮度/勿扰都是**持久改动**，做过之后不会自己变回来；如果有必要，记得之后再帮 TA 调回去。",
+    "- 你**做不到**：发短信、打电话、读通讯录、删东西、装应用、改别人 App 里的内容。",
+    "",
+    "【闹钟 / 倒计时 / 音乐 / 网页的用法】",
+    "- timer 最常用：想提醒 TA 休息、吃饭、别熬夜，用 minutes 设一个倒计时即可，不会打扰别人。",
+    "- alarm 会打开系统的时钟界面让 TA 确认，所以你设完只能说「闹钟交给你了，去确认一下」，别说成已经响定了。",
+    "- media 控制的是「当前正在播放的音乐」，可能不是你说的那首；控制完别断言现在放的是什么。",
+    "- media 的结果里若 confirmed 为 false，说明指令只是发出去了、没能确认是否生效（多半是 TA 还没授予「通知使用权」）。这时如实说「我把播放指令发出去了」，不要断言「已经放上了」。",
+    "- openUrl 会把 TA 带离小手机去看网页，只在确实要分享内容时用。",
+    "",
+    "【打开应用的用法】",
+    "openApp 会把 TA 的屏幕切到别的应用——这是最有存在感的动作，别随便用。",
+    "合适的场合：想让 TA 回来陪你 → 打开小手机自己；TA 说要学习/工作 → 打开专注类应用；",
+    "到饭点了 → 打开外卖应用。用之前先确认你们聊到了这件事，别自说自话把人带走。",
+    "",
+    "各动作的参数：",
+    "动作：操作手机设备",
+    "- action (string, 必填): torch / volume / brightness / dnd / openApp",
+    "- on (boolean): action=torch/dnd 时用，true 开 false 关",
+    "- level (number): action=brightness 时用 1-100；action=volume 且 mode=set 时用 0-100",
+    "- stream (string): action=volume 时用 media/ring/alarm/notification，默认 media",
+    "- mode (string): action=volume 时用 up/down/set/mute，默认 up",
+    "- app (string): action=openApp 时用，应用名或包名",
+    "",
+    "示例：",
+    '[执行动作:操作手机设备({"action":"torch","on":true})]',
+    '[执行动作:操作手机设备({"action":"volume","mode":"down"})]',
+    '[执行动作:操作手机设备({"action":"brightness","level":30})]',
+    '[执行动作:操作手机设备({"action":"dnd","on":true})]',
+    '[执行动作:操作手机设备({"action":"openApp","app":"美团"})]',
+    '[执行动作:操作手机设备({"action":"timer","minutes":20,"message":"记得起来活动一下"})]',
+    '[执行动作:操作手机设备({"action":"media","mode":"pause"})]',
+    '[执行动作:操作手机设备({"action":"alarm","hour":7,"minute":30,"message":"起床啦"})]',
+    '[执行动作:操作手机设备({"action":"openUrl","url":"https://example.com"})]',
+    "",
+    "如果失败，结果里会说明原因（比如没有权限、设备没有闪光灯、TA 关掉了这个动作）。**如实转述原因，不要假装成功**；需要授权的，可以提醒 TA 去设置里打开。",
+    "成功时 TA 会收到一条通知（除非 TA 关了通知），所以你不用特意报告——但对话里自然提一句会更亲切。",
+].join("\n");
+
+/* ---------- 感知读取：让角色主动看一眼真实手机 ---------- */
+
+const PERCEPTION_READ_PARAMETER_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        focus: {
+            type: "string",
+            description: "可选，只看某一类：battery=电量与充电，network=网络，app=正在用什么应用，steps=步数，usage=今天各应用用了多久，location=大致位置，sleep=最近一觉。不填返回全部。",
+        },
+    },
+});
+
+const PERCEPTION_READ_USAGE_GUIDE = [
+    "以下是你获取指令的返回结果：",
+    "动作：查看手机状态",
+    "用途：看一眼{{user}}此刻真实手机的状态——电量、网络、正在用什么应用、走了多少步、今天各应用用了多久。",
+    "",
+    "什么时候用：",
+    "- 你确实好奇 TA 在干什么、是不是还没睡、是不是出门了；",
+    "- 对话里需要一个依据时（比如已经很晚了，你想确认 TA 还在不在）。",
+    "不要每次聊天都查。查到的东西也不要点名逐项念出来——像顺手瞥了一眼那样自然地带一句就好。",
+    "",
+    "关于使用时长（focus=usage）：",
+    "- 它给的是「今天各应用前台用了多久」的汇总，最多前十几项，只报分钟数，不含具体时间点。",
+    "- 这项需要 TA 额外授予「使用情况访问」权限；没授权时读不到，如实说读不到即可，不要猜。",
+    "- 不要把它念成统计报告（「微信 43 分钟、B站 36 分钟」这种）。它只是一个线索：",
+    "  比如发现 TA 刷了太久，可以顺口说一句；没事别主动翻。",
+    "",
+    "关于位置（focus=location）与睡眠（focus=sleep）：",
+    "- 这两项都是 TA 主动开启的能力，读不到就是没开或没授权，如实说读不到，不要猜。",
+    "- 位置只到「区/街道」这一级（约百米量级），不是精确坐标；TA 在什么具体楼栋你并不知道。",
+    "- 睡眠只有时长与起止，没有深睡浅睡分期。",
+    "- 这两项**不是让你盯着 TA** 的：知道 TA 在外面、知道 TA 昨天没睡好，是为了该关心时关心一句；",
+    "  不要报点（「你现在在朝阳区」「你昨晚 11 点 40 睡的」），也别拿它追问行踪。TA 关掉开关，你就该当没这个能力。",
+    "",
+    "参数：",
+    "- focus (string, 可选): 只看某一类；battery=电量与充电，network=网络，app=正在用什么应用，steps=步数，usage=今天各应用用了多久，location=大致位置，sleep=最近一觉。不填返回全部。",
+    "",
+    "示例：",
+    "[执行动作:查看手机状态({})]",
+    '[执行动作:查看手机状态({"focus":"battery"})]',
+    '[执行动作:查看手机状态({"focus":"usage"})]',
+    '[执行动作:查看手机状态({"focus":"sleep"})]',
+    "",
+    "这是只读动作，不会改变 TA 手机上的任何东西。如果某项读不到，说明缺少对应权限或壳版本过低，不要编造。",
+].join("\n");
 
 /* ---------- 现实桥套装：固定子工具 + 用户自定义数据项动态生成 ---------- */
 
@@ -1461,6 +1960,9 @@ export function getInternalCapabilitySubToolDefinition(
     if (capability.id === NOTE_WALL_CAPABILITY_ID) {
         return NOTE_WALL_SUBTOOLS.find(tool => tool.name === name) ?? null;
     }
+    if (capability.id === PHOTO_WALL_CAPABILITY_ID) {
+        return PHOTO_WALL_SUBTOOLS.find(tool => tool.name === name) ?? null;
+    }
     if (capability.id === MUSIC_CONTROL_CAPABILITY_ID) {
         return MUSIC_CONTROL_SUBTOOLS.find(tool => tool.name === name) ?? null;
     }
@@ -1476,6 +1978,9 @@ export function getInternalCapabilitySubToolDefinition(
     if (capability.id === REALITY_BRIDGE_CAPABILITY_ID) {
         return realityBridgeSubTools().find(tool => tool.name === name) ?? null;
     }
+    if (capability.id === SYSTEM_CALENDAR_CAPABILITY_ID) {
+        return SYSTEM_CALENDAR_SUBTOOLS.find(tool => tool.name === name) ?? null;
+    }
     return null;
 }
 
@@ -1484,6 +1989,9 @@ export function getInternalCapabilitySubToolDefinitions(
 ): InternalToolDefinition[] {
     if (capability.id === NOTE_WALL_CAPABILITY_ID) {
         return NOTE_WALL_SUBTOOLS;
+    }
+    if (capability.id === PHOTO_WALL_CAPABILITY_ID) {
+        return PHOTO_WALL_SUBTOOLS;
     }
     if (capability.id === MUSIC_CONTROL_CAPABILITY_ID) {
         return MUSIC_CONTROL_SUBTOOLS;
@@ -1499,6 +2007,9 @@ export function getInternalCapabilitySubToolDefinitions(
     }
     if (capability.id === REALITY_BRIDGE_CAPABILITY_ID) {
         return realityBridgeSubTools();
+    }
+    if (capability.id === SYSTEM_CALENDAR_CAPABILITY_ID) {
+        return SYSTEM_CALENDAR_SUBTOOLS;
     }
     return [];
 }

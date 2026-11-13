@@ -5,7 +5,6 @@ export type DataModuleId =
   | "desktop"
   | "memory"
   | "social"
-  | "favorites"
   | "apps"
   | "resource_hub"
   | "creative"

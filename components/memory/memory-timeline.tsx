@@ -2,7 +2,6 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { NativeTimelineEntry } from "@/lib/short-term-assembler";
-import { getNativeTimelineEntryKey } from "@/lib/native-timeline-key";
 import { buildTwoLevelMomentThreads } from "@/lib/moments-comment-threading";
 import { findStickerByName } from "@/lib/sticker-data";
 import { getChatImageFromIndexedDB } from "@/lib/chat-asset-storage";
@@ -12,7 +11,7 @@ import { getChatImageFromIndexedDB } from "@/lib/chat-asset-storage";
    ================================================================ */
 
 /** 固定展示顺序：私聊 / 群聊 / 查手机 / 朋友圈 / 剧情 / 其他APP */
-export const MEMORY_SOURCE_TAG_ORDER: readonly string[] = ["私聊", "群聊", "查手机", "朋友圈", "剧情", "其他APP"];
+export const MEMORY_SOURCE_TAG_ORDER: readonly string[] = ["私聊", "群聊", "查手机", "朋友圈", "剧情", "照片墙", "生活", "小组件", "一起看", "其他APP"];
 
 /** 事件来源 → 筛选标签（其余来源一律归入「其他APP」收纳） */
 export function getMemoryEventSourceTag(evt: NativeTimelineEntry): string {
@@ -21,6 +20,10 @@ export function getMemoryEventSourceTag(evt: NativeTimelineEntry): string {
     if (app === "checkphone") return "查手机";
     if (app === "moments") return "朋友圈";
     if (app === "story") return "剧情";
+    if (app === "photo_wall") return "照片墙";
+    if (app === "life") return "生活";
+    if (app === "phone_widget") return "小组件";
+    if (app === "watch" || app === "global_watch") return "一起看";
     return "其他APP";
 }
 
@@ -96,7 +99,6 @@ type TimelineCluster = {
     tags: string[];
     excerpts: string[];
     entryCount: number;
-    entryIds: string[];
 };
 
 /* ================================================================
@@ -141,7 +143,7 @@ function parseEntry(evt: NativeTimelineEntry, userName: string): ParsedEntry | n
                 id: evt.id,
                 timestamp: evt.timestamp,
                 sender: m[1],
-                isUser: evt.authorType ? evt.authorType === "user" : m[1] === userName,
+                isUser: m[1] === userName,
                 message: inner ? inner[1] : raw,
                 innerMonologue: inner ? inner[2] : undefined,
             };
@@ -158,7 +160,7 @@ function parseEntry(evt: NativeTimelineEntry, userName: string): ParsedEntry | n
                 timestamp: evt.timestamp,
                 groupName: m[1],
                 sender: m[2],
-                isUser: evt.authorType ? evt.authorType === "user" : m[2] === userName,
+                isUser: m[2] === userName,
                 message: m[3],
             };
         }
@@ -342,7 +344,6 @@ function buildCluster(entries: ParsedEntry[]): TimelineCluster {
         tags: Array.from(tagSet),
         excerpts,
         entryCount: entries.length,
-        entryIds: entries.map(entry => entry.id),
     };
 }
 
@@ -619,9 +620,6 @@ type Props = {
     events: NativeTimelineEntry[];
     userName: string;
     activeTags?: ReadonlySet<string>;
-    selectionMode?: boolean;
-    selectedEventIds?: ReadonlySet<string>;
-    onToggleCluster?: (eventIds: string[]) => void;
 };
 
 const EMPTY_ACTIVE_TAGS: ReadonlySet<string> = new Set<string>();
@@ -629,14 +627,7 @@ const EMPTY_ACTIVE_TAGS: ReadonlySet<string> = new Set<string>();
 // 每批渲染的簇数：全部一次性渲染会在重数据账号上把 DOM 撑爆
 const CLUSTER_PAGE_SIZE = 30;
 
-export function MemoryTimeline({
-    events,
-    userName,
-    activeTags = EMPTY_ACTIVE_TAGS,
-    selectionMode = false,
-    selectedEventIds = EMPTY_ACTIVE_TAGS,
-    onToggleCluster,
-}: Props) {
+export function MemoryTimeline({ events, userName, activeTags = EMPTY_ACTIVE_TAGS }: Props) {
     const [expandedClusterId, setExpandedClusterId] = useState<string | null>(null);
     const [visibleCount, setVisibleCount] = useState(CLUSTER_PAGE_SIZE);
 
@@ -646,7 +637,7 @@ export function MemoryTimeline({
     }, [events, activeTags]);
 
     const clusters = useMemo(() => {
-        const parsed = filteredEvents.map(e => parseEntry({ ...e, id: getNativeTimelineEntryKey(e) }, userName)).filter((e): e is ParsedEntry => e !== null);
+        const parsed = filteredEvents.map(e => parseEntry(e, userName)).filter((e): e is ParsedEntry => e !== null);
         return clusterByTimeGap(parsed);
     }, [filteredEvents, userName]);
 
@@ -679,29 +670,15 @@ export function MemoryTimeline({
             <div className="mem-tl mem-tl-cards">
                 {clusters.slice(0, visibleCount).map((cluster) => {
                     const expanded = expandedClusterId === cluster.id;
-                    const selectedCount = cluster.entryIds.filter(id => selectedEventIds.has(id)).length;
-                    const selected = selectedCount === cluster.entryIds.length;
                     return (
                         <div
                             key={cluster.id}
-                            className={`g-card mem-tl-card${expanded ? " is-expanded" : ""}${selectionMode ? " is-selecting" : ""}${selected ? " is-selected" : ""}`}
-                            onClick={() => {
-                                if (selectionMode) {
-                                    onToggleCluster?.(cluster.entryIds);
-                                    return;
-                                }
-                                setExpandedClusterId(expanded ? null : cluster.id);
-                            }}
+                            className={`g-card mem-tl-card${expanded ? " is-expanded" : ""}`}
+                            onClick={() => setExpandedClusterId(expanded ? null : cluster.id)}
                         >
-                            {selectionMode ? (
-                                <span className="mem-tl-select-indicator" data-selected={selected ? "" : undefined} aria-hidden="true">
-                                    {selected ? "✓" : ""}
-                                </span>
-                            ) : (
-                                <span className="ts-10 font-bold uppercase tracking-widest" style={{
-                                    color: "var(--c-danger)", opacity: 0.6, position: "absolute", right: 12, top: 12
-                                }}>REPORT</span>
-                            )}
+                            <span className="ts-10 font-bold uppercase tracking-widest" style={{
+                                color: "var(--c-danger)", opacity: 0.6, position: "absolute", right: 12, top: 12
+                            }}>REPORT</span>
                             <div className="flex justify-between items-center pb-2 mb-2" style={{ borderBottom: "1px dashed var(--c-panel-border)" }}>
                                 <span className="ts-11 text-secondary" style={{ letterSpacing: "1px" }}>[ DATE: {formatClusterDate(cluster)} ]</span>
                             </div>

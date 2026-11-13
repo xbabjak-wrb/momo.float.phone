@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Brain, Filter, MoreHorizontal, Sparkles, Trash2 } from "lucide-react";
+import { Brain, Filter, MoreHorizontal, Sparkles } from "lucide-react";
 import { MemoryBankPage } from "./memory/memory-bank-page";
 import { VnAssetPage } from "./vn/vn-asset-page";
 import { loadCharacters } from "@/lib/character-storage";
@@ -38,14 +38,13 @@ export function PhoneResourcesApp({ onClose, onNotice, initialPage }: { onClose:
     const [memoryCharId, setMemoryCharId] = useState<string>("");
     const [memoryCharName, setMemoryCharName] = useState<string>("");
     const [memoryFilterOpen, setMemoryFilterOpen] = useState(false);
-    const [memoryFilterState, setMemoryFilterState] = useState({ visible: false, activeCount: 0, bulkDeleteVisible: false, bulkSelecting: false });
-    const [memoryBulkDeleteRequest, setMemoryBulkDeleteRequest] = useState(0);
+    const [memoryFilterState, setMemoryFilterState] = useState({ visible: false, activeCount: 0 });
 
     const handleMemoryFilterOpenChange = useCallback((open: boolean) => {
         setMemoryFilterOpen(open);
     }, []);
 
-    const handleMemoryFilterStateChange = useCallback((state: { visible: boolean; activeCount: number; bulkDeleteVisible: boolean; bulkSelecting: boolean }) => {
+    const handleMemoryFilterStateChange = useCallback((state: { visible: boolean; activeCount: number }) => {
         setMemoryFilterState(state);
     }, []);
 
@@ -92,7 +91,7 @@ export function PhoneResourcesApp({ onClose, onNotice, initialPage }: { onClose:
                 : "资源库";
 
     const showSettingsIcon = currentPage === "memory" && memoryView !== "settings";
-    const showMemoryFilterIcon = currentPage === "memory" && memoryView === "detail" && memoryFilterState.visible && !memoryFilterState.bulkSelecting;
+    const showMemoryFilterIcon = currentPage === "memory" && memoryView === "detail" && memoryFilterState.visible;
 
     return (
         <PageShell
@@ -113,20 +112,6 @@ export function PhoneResourcesApp({ onClose, onNotice, initialPage }: { onClose:
                             {memoryFilterState.activeCount > 0 ? (
                                 <span className="memory-header-filter-badge">{memoryFilterState.activeCount}</span>
                             ) : null}
-                        </button>
-                    ) : null}
-                    {memoryFilterState.bulkDeleteVisible && !memoryFilterState.bulkSelecting ? (
-                        <button
-                            onClick={() => {
-                                setMemoryFilterOpen(false);
-                                setMemoryBulkDeleteRequest(value => value + 1);
-                            }}
-                            className="page-back-btn memory-header-delete-btn"
-                            type="button"
-                            aria-label="批量删除短期记忆"
-                            title="批量删除短期记忆"
-                        >
-                            <Trash2 size={19} strokeWidth={1.6} />
                         </button>
                     ) : null}
                     <button
@@ -178,7 +163,6 @@ export function PhoneResourcesApp({ onClose, onNotice, initialPage }: { onClose:
                         filterOpen={memoryFilterOpen}
                         onFilterOpenChange={handleMemoryFilterOpenChange}
                         onFilterStateChange={handleMemoryFilterStateChange}
-                        bulkDeleteRequest={memoryBulkDeleteRequest}
                     />
                 )}
             </div>

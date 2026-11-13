@@ -1,0 +1,74 @@
+name: Validate Android Reality Bridge
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, feature/life-system, feature/life-system-mainline]
+    paths:
+      - "android-shell/**"
+      - "components/reality-bridge-app.tsx"
+      - "components/reality-bridge-scheduler.tsx"
+      - "components/device-action/**"
+      - "components/perception/**"
+      - "components/screenshot/**"
+      - "components/system-calendar/**"
+      - "components/widget/**"
+      - "lib/reality-bridge/**"
+      - "lib/device-action/**"
+      - "lib/perception/**"
+      - "lib/screenshot/**"
+      - "lib/system-calendar/**"
+      - "lib/widget/**"
+      - "app/api/push/**"
+      - "public/ai-phone-push/**"
+      - "supabase/functions/ai-phone-push/**"
+      - "supabase/functions/push-bridge/**"
+      - "supabase/functions/push-generate/**"
+      - "scripts/check-android-permissions.mjs"
+      - "scripts/check-android-reality-bridge.mjs"
+      - ".github/workflows/android-reality-bridge-validation.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "android-shell/**"
+      - "components/reality-bridge-app.tsx"
+      - "components/reality-bridge-scheduler.tsx"
+      - "components/device-action/**"
+      - "components/perception/**"
+      - "components/screenshot/**"
+      - "components/system-calendar/**"
+      - "components/widget/**"
+      - "lib/reality-bridge/**"
+      - "lib/device-action/**"
+      - "lib/perception/**"
+      - "lib/screenshot/**"
+      - "lib/system-calendar/**"
+      - "lib/widget/**"
+      - "app/api/push/**"
+      - "public/ai-phone-push/**"
+      - "supabase/functions/ai-phone-push/**"
+      - "supabase/functions/push-bridge/**"
+      - "supabase/functions/push-generate/**"
+      - "scripts/check-android-permissions.mjs"
+      - "scripts/check-android-reality-bridge.mjs"
+      - ".github/workflows/android-reality-bridge-validation.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check Android permissions and bridge version parity
+        run: node scripts/check-android-permissions.mjs
+
+      - name: Check every Reality Bridge layer and web/native contract
+        run: node scripts/check-android-reality-bridge.mjs

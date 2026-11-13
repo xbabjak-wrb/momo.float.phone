@@ -4,6 +4,7 @@
 
 import type { PresetConfig } from "./settings-types";
 import { getCheckPhonePromptTags } from "./checkphone-config";
+import { createBuiltinAppPrompts } from "./builtin-app-prompts";
 
 export const BUILTIN_PRESET_ID = "builtin_default_v1";
 export const BUILTIN_PRESET_VERSION = 265; // 升版本会用出厂内容重写用户的内置预设副本（自定义会丢），非必要不升
@@ -41,6 +42,19 @@ export function createBuiltinPreset(): PresetConfig {
             { identifier: "calendarSchedule", enabled: true },
             { identifier: "memoryCore", enabled: true },
             { identifier: "memoryLongTerm", enabled: true },
+            { identifier: "life_scene_output_contract", enabled: true },
+            { identifier: "life_scene_behavior", enabled: true },
+            { identifier: "life_scene_tools", enabled: true },
+            { identifier: "life_scene_task", enabled: true },
+            { identifier: "life_autonomy_task", enabled: true },
+            { identifier: "life_schedule_task", enabled: true },
+            { identifier: "life_invitation_task", enabled: true },
+            { identifier: "photo_wall_annotation", enabled: true },
+            { identifier: "photo_wall_doodle", enabled: true },
+            { identifier: "watch_together_review", enabled: true },
+            { identifier: "watch_together_comment", enabled: true },
+            { identifier: "reality_bridge_offline_library", enabled: true },
+            { identifier: "phone_widget_status", enabled: true },
 
             // ── Divider ──
             { identifier: "shortTermMemory", enabled: true },
@@ -411,7 +425,7 @@ export function createBuiltinPreset(): PresetConfig {
                     "【规则】只在关系和场景自然合适时使用；商品名要具体，像真实可以送出的物品；不要编造订单号、价格或物流信息。",
                     "",
                     "### 发照片",
-                    "【格式】[照片:使用参考图:描述] 或 [照片:不使用参考图:描述]（画面出现{{char}}、{{user}}或两人合照时必须使用参考图；纯场景/物件可不使用。）",
+                    "【格式】[照片:使用参考图:描述] 或 [照片:不使用参考图:描述]（生成{{char}}照片时必须使用参考图，场景可不使用参考图。）",
                     "【重要】描述会交给生图模型生成真实图片，请按生图提示词来写：只写可见画面（主体、动作、环境、光线、构图），要素具体；不写心理、声音、剧情，不用代词指代。",
                     "【示例】[照片:使用参考图:雨夜出租车后座，{{char}}侧脸贴着车窗，霓虹灯光在车窗玻璃上晕开红蓝光斑，近景特写，昏暗氛围]",
                     "",
@@ -691,7 +705,7 @@ export function createBuiltinPreset(): PresetConfig {
                     "#发朋友圈指令：",
                     "【要求】",
                     "- **禁止重复自己在<shortTermMemory>里最近已经发过的朋友圈！**",
-                    "- **照片中只要出现{{char}}、{{user}}或两人合照，必须输出[照片:使用参考图:照片描述]；只有画面完全不出现两人、仅为景物、食物或物件时，才输出[照片:不使用参考图:照片描述]。描述中要明确写出谁出镜，合照必须同时写出{{char}}和{{user}}。**",
+                    "- **照片中只要出现{{char}}本人，必须输出[照片:使用参考图:照片描述]；只有画面完全不出现{{char}}、仅为景物、食物或物件时，才输出[照片:不使用参考图:照片描述]。**",
                     "",
                     "【格式】",
                     "[朋友圈]",
@@ -917,7 +931,7 @@ export function createBuiltinPreset(): PresetConfig {
                     "[/朋友圈]",
                     "【要求】",
                     "- 不要重复最近已经发过的朋友圈；emoji 直接用真实字符，不要用方括号表情。",
-                    "- 照片中只要出现{{char}}、{{user}}或两人合照，必须使用参考图，并在描述中明确写出谁出镜；只有画面完全不出现两人、仅为景物、食物或物件时，才不使用参考图。",
+                    "- 照片中只要出现{{char}}本人，必须使用参考图；只有画面完全不出现{{char}}、仅为景物、食物或物件时，才不使用参考图。",
                     "",
                     "### 评论朋友圈指令：",
                     "【格式】",
@@ -1070,7 +1084,7 @@ export function createBuiltinPreset(): PresetConfig {
                     "【格式】[角色名]: [A拒绝了B的代付]",
                     "",
                     "### 发照片",
-                    "【格式】[角色名]: [照片:使用参考图:描述] 或 [角色名]: [照片:不使用参考图:描述]（画面出现发图角色、{{user}}或两人合照时必须使用参考图；纯场景/物件可不使用。）",
+                    "【格式】[角色名]: [照片:使用参考图:描述] 或 [角色名]: [照片:不使用参考图:描述]（生成角色本人照片时必须使用参考图，场景可不使用参考图。）",
                     "【重要】描述会交给生图模型生成真实图片，请按生图提示词来写：只写可见画面（主体、动作、环境、光线、构图），要素具体；不写心理、声音、剧情，不用代词指代。",
                     "【示例】[萧齐]: [照片:使用参考图:雨夜出租车后座，萧齐侧脸贴着车窗，霓虹灯光在车窗玻璃上晕开红蓝光斑，近景特写，昏暗氛围]",
                     "",
@@ -1271,7 +1285,7 @@ export function createBuiltinPreset(): PresetConfig {
                     "[/朋友圈]",
                     "【要求】",
                     "- 角色名必须是当前群聊成员；内容符合该角色性格和心情；emoji 直接用真实字符，不要用方括号表情。",
-                    "- 照片中只要出现发帖角色、{{user}}或两人合照，必须使用参考图，并在描述中明确写出谁出镜；只有画面完全不出现两人、仅为景物、食物或物件时，才不使用参考图。",
+                    "- 照片中只要出现发帖角色本人，必须使用参考图；只有画面完全不出现该角色、仅为景物、食物或物件时，才不使用参考图。",
                     "",
                     "### 某角色评论朋友圈：",
                     "【格式】",
@@ -4128,6 +4142,7 @@ export function createBuiltinPreset(): PresetConfig {
                 enabled: true,
                 tags: ["checkphone"],
             },
+            ...createBuiltinAppPrompts(),
         ],
     };
 }

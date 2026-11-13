@@ -1077,7 +1077,6 @@ async function buildWeixinCloudPromptContext(params: {
     {
       history: params.messages,
       includeNativeToolHistory: usesNativeActions,
-      chatAccountId: params.session.chatAccountId || null,
       timeAware: params.chatAppSettings.timeAware,
     },
   );

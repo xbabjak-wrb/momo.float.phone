@@ -8,8 +8,8 @@ import { ChatRoom } from "./chat-room";
 import { MascotChatRoom } from "./mascot-chat-room";
 import { UserProfilePanel } from "./user-profile-panel";
 import { MessageCircle, Users, Aperture, UserRound } from "lucide-react";
-import { ChatSession, type ChatMessage, loadChatSessions, pushChatMessage, hydrateChatStorage, markChatSessionRead, setActiveChatSessionId } from "@/lib/chat-storage";
-import type { MomentPost } from "@/lib/moments-types";
+import { ChatHistorySearch } from "./chat-history-search";
+import { ChatSession, loadChatSessions, pushChatMessage, hydrateChatStorage, markChatSessionRead, setActiveChatSessionId } from "@/lib/chat-storage";
 import { notifyMascotPageContext } from "@/lib/mascot-events";
 import { loadCharacters } from "@/lib/character-storage";
 import { SessionCustomCSS } from "@/components/ui/session-custom-css";
@@ -18,40 +18,8 @@ import { formatXiaohongshuShareForPrompt, type ChatSharePayload } from "@/lib/ch
 import { CHAT_OPEN_SESSION_EVENT, CHAT_OPEN_ADD_CONTACT_EVENT } from "@/lib/chat-notification-events";
 import { CHAT_SESSIONS_MERGED_EVENT, type ChatSessionsMergedDetail } from "@/lib/chat-session-merge";
 import { getMascotSettingsSnapshot } from "@/lib/mascot-settings";
-import { CHAT_SCOPE_UPDATED_EVENT, loadChatScope, sessionMatchesChatScope, type ChatScopeState } from "@/lib/chat-scope-storage";
 
 type TabKey = "messages" | "contacts" | "feeds" | "me";
-
-function sameGroupMembers(a?: string[], b?: string[]): boolean {
-    const left = [...(a || [])].sort();
-    const right = [...(b || [])].sort();
-    return left.length === right.length && left.every((id, index) => id === right[index]);
-}
-
-/**
- * 外部入口可能携带另一个聊天账号的旧 sessionId。当前界面显示哪个账号，
- * 就只允许进入该账号的会话；私聊/群聊均尽量映射到当前账号下的对应会话。
- */
-function resolveSessionInCurrentScope(sessionId: string): ChatSession | null {
-    const sessions = loadChatSessions();
-    const requested = sessions.find(item => item.id === sessionId);
-    if (!requested) return null;
-    const scope = loadChatScope();
-    if (sessionMatchesChatScope(requested, scope)) return requested;
-    if (!requested.isGroup) {
-        return sessions.find(item => (
-            !item.isGroup
-            && item.contactId === requested.contactId
-            && sessionMatchesChatScope(item, scope)
-        )) || null;
-    }
-    return sessions.find(item => (
-        item.isGroup
-        && Boolean(item.isSpectator) === Boolean(requested.isSpectator)
-        && sameGroupMembers(item.participantIds, requested.participantIds)
-        && sessionMatchesChatScope(item, scope)
-    )) || null;
-}
 
 export type PhoneChatAppProps = {
     onClose: () => void;
@@ -59,18 +27,13 @@ export type PhoneChatAppProps = {
     onSessionChange?: (session: ChatSession | null) => void;
     sharePayload?: ChatSharePayload | null;
     onShareDone?: () => void;
-    /** Story floating-window bridge. Only messages actually sent by the user are reported. */
-    onUserMessageSent?: (message: ChatMessage, session: ChatSession) => void;
-    /** Story floating-window bridge for user-published Moments. */
-    onMomentPublished?: (post: MomentPost) => void;
 };
 
-export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSessionId, onSessionChange, sharePayload, onShareDone, onUserMessageSent, onMomentPublished }: PhoneChatAppProps) {
+export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSessionId, onSessionChange, sharePayload, onShareDone }: PhoneChatAppProps) {
     const [activeTab, setActiveTab] = useState<TabKey>("messages");
+    const [showHistorySearch, setShowHistorySearch] = useState(false);
     const [activeSession, setActiveSession] = useState<ChatSession | null>(null);
     const [activeMascot, setActiveMascot] = useState(false);
-    const [contactProfileOpen, setContactProfileOpen] = useState(false);
-    const [contactCall, setContactCall] = useState<{ id: string; sessionId: string; type: "voice" | "video" } | null>(null);
     // Chat app-level custom CSS (affects all chat pages, lower priority than per-session CSS)
     const [chatAppCSS, setChatAppCSS] = useState(() =>
         typeof window !== "undefined" ? kvGet("chat-app-custom-css") || "" : ""
@@ -86,7 +49,7 @@ export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSession
             setDbReady(true);
             // Resolve initial session after hydration
             if (initialSessionId) {
-                const s = resolveSessionInCurrentScope(initialSessionId);
+                const s = loadChatSessions().find(s => s.id === initialSessionId);
                 if (s) setActiveSession(s);
             }
         });
@@ -103,8 +66,8 @@ export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSession
             setActiveSession(null);
             return;
         }
-        const s = resolveSessionInCurrentScope(initialSessionId);
-        setActiveSession(s);
+        const s = loadChatSessions().find(s => s.id === initialSessionId);
+        if (s) setActiveSession(s);
     }, [initialSessionId, dbReady]);
 
     // When sharePayload is set, switch to contacts tab (and close any open chat room)
@@ -120,7 +83,7 @@ export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSession
         const handler = (e: Event) => {
             const sessionId = (e as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
             if (!sessionId) return;
-            const session = resolveSessionInCurrentScope(sessionId);
+            const session = loadChatSessions().find(s => s.id === sessionId);
             if (!session) return;
             setActiveMascot(false);
             setActiveSession(session);
@@ -128,23 +91,6 @@ export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSession
         };
         window.addEventListener(CHAT_OPEN_SESSION_EVENT, handler);
         return () => window.removeEventListener(CHAT_OPEN_SESSION_EVENT, handler);
-    }, []);
-
-    // 切换主号/小号后，旧账号的聊天室不能继续留在前台或挂载缓存中。
-    useEffect(() => {
-        const handler = (event: Event) => {
-            const scope = (event as CustomEvent<ChatScopeState>).detail || loadChatScope();
-            setContactCall(null);
-            setActiveSession(current => current && sessionMatchesChatScope(current, scope) ? current : null);
-            setVisitedSessions(current => {
-                const next = new Map(
-                    [...current.entries()].filter(([, session]) => sessionMatchesChatScope(session, scope)),
-                );
-                return next.size === current.size ? current : next;
-            });
-        };
-        window.addEventListener(CHAT_SCOPE_UPDATED_EVENT, handler);
-        return () => window.removeEventListener(CHAT_SCOPE_UPDATED_EVENT, handler);
     }, []);
 
     // 重复会话被合并：被删会话的聊天室缓存一并卸载
@@ -311,23 +257,17 @@ export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSession
         <div
             className="chat-app absolute inset-0 flex flex-col overflow-hidden z-10"
             {...(activeSession || activeMascot ? { "data-room-active": "" } : {})}
-            {...(hideTabBar || contactProfileOpen ? { "data-tabbar-hidden": "" } : {})}
+            {...(hideTabBar ? { "data-tabbar-hidden": "" } : {})}
         >
             {/* Homepage appearance CSS is the lowest chat styling layer. */}
             {chatAppCSS && <SessionCustomCSS css={chatAppCSS} scope=".chat-app" />}
             {/* The Main Content Area */}
             <div className="chat-main-content relative flex-1 flex flex-col overflow-hidden" {...(activeSession || activeMascot ? { "data-covered-by-room": "" } : {})}>
-                {activeTab === "messages" && <ChatMessageList onCloseApp={onClose} activeSession={activeSession} onSelectSession={(session) => { setActiveMascot(false); setActiveSession(session); }} onSelectMascot={handleSelectMascot} />}
+                {activeTab === "messages" && <ChatMessageList onCloseApp={onClose} onOpenHistorySearch={() => setShowHistorySearch(true)} activeSession={activeSession} onSelectSession={(session) => { setActiveMascot(false); setActiveSession(session); }} onSelectMascot={handleSelectMascot} />}
                 {activeTab === "contacts" && (
                     <ChatContactsList
                         onCloseApp={onClose}
                         onSelectSession={handleSelectContact}
-                        selectForShare={Boolean(sharePayload)}
-                        onSubpageChange={setContactProfileOpen}
-                        onStartCall={(session, type) => {
-                            setContactCall({ id: `contact-call-${Date.now()}-${Math.random().toString(36).slice(2)}`, sessionId: session.id, type });
-                            setActiveMascot(false); setActiveSession(session); setActiveTab("messages");
-                        }}
                         onSelectMascot={handleSelectMascot}
                         pendingAddContactId={pendingAddContactId}
                         onPendingAddContactConsumed={() => setPendingAddContactId(null)}
@@ -335,19 +275,38 @@ export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSession
                             const sessionId = addContactReturnSessionRef.current;
                             addContactReturnSessionRef.current = null;
                             if (!sessionId) return;
-                            const session = resolveSessionInCurrentScope(sessionId);
+                            const session = loadChatSessions().find(s => s.id === sessionId);
                             if (!session) return;
                             setActiveSession(session);
                             setActiveTab("messages");
                         }}
                     />
                 )}
-                {activeTab === "feeds" && <MomentsFeed onCloseApp={onClose} onUserPublished={onMomentPublished} />}
+                {activeTab === "feeds" && <MomentsFeed onCloseApp={onClose} />}
                 {activeTab === "me" && <UserProfilePanel onClose={() => setActiveTab("messages")} />}
             </div>
 
+            {showHistorySearch && (
+                <ChatHistorySearch
+                    onClose={() => setShowHistorySearch(false)}
+                    onJump={(sessionId, messageId) => {
+                        const targetSession = loadChatSessions().find(item => item.id === sessionId);
+                        if (!targetSession) return;
+                        setActiveMascot(false);
+                        setActiveTab("messages");
+                        setActiveSession(targetSession);
+                        setShowHistorySearch(false);
+                        // Switching from the global search also mounts a new ChatRoom. Wait for its
+                        // message listener and storage-backed list to be ready before dispatching the jump.
+                        window.setTimeout(() => {
+                            window.dispatchEvent(new CustomEvent("chat-history-jump-to-message", { detail: { sessionId, messageId } }));
+                        }, 360);
+                    }}
+                />
+            )}
+
             {/* Bottom Navigation Bar — hide when inside a chat room */}
-            <nav className="chat-tab-bar chat-bottom-glass-bar" data-ui="nav" style={{ display: activeSession || activeMascot || hideTabBar || contactProfileOpen ? "none" : undefined }}>
+            <nav className="chat-tab-bar chat-bottom-glass-bar" data-ui="nav" style={{ display: activeSession || activeMascot || hideTabBar ? "none" : undefined }}>
                 <button
                     className={`chat-tab ${activeTab === "messages" ? "chat-tab-active" : ""}`}
                     onClick={() => setActiveTab("messages")}
@@ -383,10 +342,8 @@ export const PhoneChatApp = memo(function PhoneChatApp({ onClose, initialSession
                 <div key={sess.id} style={{ display: activeSession?.id === sess.id ? undefined : 'none' }} className="chat-room-layer absolute inset-0">
                     <ChatRoom
                         session={sess}
-                        contactCallRequest={contactCall?.sessionId === sess.id ? contactCall : undefined}
-                        onContactCallHandled={() => setContactCall(null)}
+                        isActive={activeSession?.id === sess.id}
                         onBack={() => setActiveSession(null)}
-                        onUserMessageSent={message => onUserMessageSent?.(message, sess)}
                         onDeleted={() => {
                             // 会话已删除：把缓存的聊天室一并卸载，避免僵尸挂载
                             setVisitedSessions(prev => {

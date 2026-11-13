@@ -1,7 +1,6 @@
 import JSZip from "jszip";
 import { downloadFile, type DownloadFileOptions } from "../download-utils";
 import { sha256BlobHex } from "../sha256-stream";
-import { createFavoriteExportTransform, type FavoriteExportEntity } from "../favorites-transfer";
 import { CLOUD_CREDENTIAL_KV_KEYS, DATA_MODULES } from "./modules";
 import { clearSource, exportSource, importSource, inspectSource } from "./idb";
 import { createMediaCollector, estimateValueBytes, utf8Bytes, type MediaCollector, type MediaResolver } from "./serializers";
@@ -152,8 +151,6 @@ export async function inspectData(): Promise<DataSnapshot> {
 }
 
 export type BackupOptions = {
-  /** Standalone favorites export: all categories and account scopes for this entity. */
-  favoriteEntity?: FavoriteExportEntity;
   /** Strip embedded images/audio/video (keeps text/config/structure + avatars). */
   excludeMedia?: boolean;
   /** Keep only recent dynamic images; avatars and desktop/theme assets stay complete. */
@@ -180,6 +177,9 @@ const MEDIA_MIN_BYTES = 2048;
 
 function stripMediaDeep(value: unknown): unknown {
   if (typeof value === "string") {
+    // media-store refs point to blobs stored out-of-band; keeping the URI while
+    // omitting the blob creates broken media cards after a light backup restore.
+    if (value.startsWith("media-store://")) return "";
     return value.length > MEDIA_MIN_BYTES && MEDIA_DATAURL_RE.test(value) ? "" : value;
   }
   if (Array.isArray(value)) return value.map(stripMediaDeep);
@@ -193,10 +193,13 @@ function stripMediaDeep(value: unknown): unknown {
 
 // KV / localStorage values are JSON strings; parse, strip nested data-URLs, re-stringify.
 function stripMediaInString(value: string): string {
-  if (typeof value !== "string" || value.length <= MEDIA_MIN_BYTES) return value;
+  if (typeof value !== "string") return value;
   if (MEDIA_DATAURL_RE.test(value)) return "";
-  if (/"data:(?:image|audio|video)/i.test(value)) {
-    try { return JSON.stringify(stripMediaDeep(JSON.parse(value))); } catch { return value; }
+  const mayContainMedia = value.includes("media-store://") || /"data:(?:image|audio|video)/i.test(value);
+  if (value.length <= MEDIA_MIN_BYTES && !mayContainMedia) return value;
+  if (mayContainMedia) {
+    try { return JSON.stringify(stripMediaDeep(JSON.parse(value))); }
+    catch { return value.replace(/media-store:\/\/[^\s"'\\]+/g, ""); }
   }
   return value;
 }
@@ -243,9 +246,7 @@ export async function buildSingleSourcePayload(
   const imageCutoffMs = options.dynamicImageDays
     ? Date.now() - options.dynamicImageDays * 24 * 60 * 60 * 1000
     : undefined;
-  const favoriteSource = source.type === "indexeddb" && source.dbName === "AiPhoneFavoritesDB";
-  let sourcePayload = await exportSource(source, moduleCollector, stripping, imageCutoffMs,
-    favoriteSource ? createFavoriteExportTransform(options.favoriteEntity, stripping, moduleCollector) : undefined);
+  let sourcePayload = await exportSource(source, moduleCollector, stripping, imageCutoffMs);
   if (stripping) sourcePayload = stripMediaFromSource(sourcePayload);
   const records = countSourceRecords(sourcePayload);
   const payload: ModulePayload = { moduleId: dataModule.id, sources: [sourcePayload] };
@@ -547,23 +548,9 @@ export async function importBackupBlob(blob: Blob, moduleIds?: DataModuleId[], o
       total.errors.push(`${fileName}: 解析失败`);
       continue;
     }
+    if (selected && !selected.has(modulePayload.moduleId)) continue;
     for (const sourcePayload of modulePayload.sources) {
-      const isFavorites = sourcePayload.type === "indexeddb" && sourcePayload.dbName === "AiPhoneFavoritesDB";
-      const effectiveModuleId = isFavorites ? "favorites" : modulePayload.moduleId;
-      // Older archives kept favorites inside social. Keep restoring those archives,
-      // and allow the Favorites app to extract just its own records from them.
-      const legacySocialSelected = isFavorites && modulePayload.moduleId === "social" && selected?.has("social");
-      if (selected && !selected.has(effectiveModuleId) && !legacySocialSelected) continue;
-      if (effectiveModuleId === "favorites" && (!isFavorites || sourcePayload.stores.some(store => store.name !== "items" || store.keyPath !== "id" || store.autoIncrement))) {
-        total.errors.push("收藏备份包含不支持的数据源，已跳过");
-        continue;
-      }
-      const sourceResolver: MediaResolver = isFavorites ? async ref => {
-        const media = await resolver(ref);
-        if (!media) throw new Error("收藏媒体缺失或损坏，未写入该条收藏");
-        return media;
-      } : resolver;
-      const result = await importSource(sourcePayload, Boolean(options.overwrite), sourceResolver);
+      const result = await importSource(sourcePayload, Boolean(options.overwrite), resolver);
       total.added += result.added;
       total.skipped += result.skipped;
       total.overwritten += result.overwritten;

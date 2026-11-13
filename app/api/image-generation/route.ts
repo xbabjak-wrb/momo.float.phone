@@ -25,6 +25,7 @@ type ImageGenerationRequest = {
   size?: string;
   quality?: string;
   referenceImageDataUrl?: string;
+  referenceImageDataUrls?: string[];
   // NovelAI 专属参数
   negativePrompt?: string;
   steps?: number;
@@ -130,7 +131,7 @@ async function externalFetch(url: string, init: RequestInit): Promise<Response> 
 }
 
 async function fetchImageUrl(url: string): Promise<{ b64: string; mimeType: string }> {
-  const res = await externalFetch(url, { method: "GET", signal: AbortSignal.timeout(45_000) });
+  const res = await externalFetch(url, { method: "GET" });
   if (!res.ok) {
     const err = await res.text().catch(() => "");
     throw new Error(`图片 URL 下载失败 ${res.status}: ${err.slice(0, 160)}`);
@@ -208,19 +209,13 @@ async function runNovelAiGeneration(input: ImageGenerationRequest): Promise<{ st
 
     const { width, height } = getNovelAiResolution(input.size);
 
-    const customUrl = input.baseUrl?.trim();
-    if (customUrl && !/^https?:\/\//i.test(customUrl)) {
-      return { status: 400, body: { error: "NovelAI 自定义 URL 必须以 http:// 或 https:// 开头" } };
-    }
-    const url = customUrl || "https://image.novelai.net/ai/generate-image";
+    const url = "https://image.novelai.net/ai/generate-image";
     const headers: Record<string, string> = {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
+      Origin: "https://novelai.net",
+      Referer: "https://novelai.net/",
     };
-    if (!customUrl) {
-      headers.Origin = "https://novelai.net";
-      headers.Referer = "https://novelai.net/";
-    }
 
     const parameters: Record<string, unknown> = {
       width,
@@ -307,7 +302,12 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     const baseUrl = input.baseUrl?.trim();
     const model = input.model?.trim();
     const prompt = input.prompt?.trim();
-    const hasReference = Boolean(input.referenceImageDataUrl?.trim());
+    const referenceImageDataUrls = (Array.isArray(input.referenceImageDataUrls) ? input.referenceImageDataUrls : [])
+      .filter((value): value is string => typeof value === "string" && Boolean(value.trim()));
+    if (referenceImageDataUrls.length === 0 && input.referenceImageDataUrl?.trim()) {
+      referenceImageDataUrls.push(input.referenceImageDataUrl.trim());
+    }
+    const hasReference = referenceImageDataUrls.length > 0;
 
     if (!apiKey) return { status: 400, body: { error: "缺少 API Key" } };
     if (!baseUrl) return { status: 400, body: { error: "缺少 Base URL" } };
@@ -319,14 +319,24 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     let body: BodyInit;
 
     if (hasReference) {
-      const converted = dataUrlToBlob(input.referenceImageDataUrl || "");
-      if (!converted) return { status: 400, body: { error: "参考图格式无效" } };
+      if (referenceImageDataUrls.length > 16) {
+        return { status: 400, body: { error: "最多支持 16 张身份参考图" } };
+      }
+      const convertedReferences = referenceImageDataUrls.map(dataUrl => dataUrlToBlob(dataUrl));
+      const invalidIndex = convertedReferences.findIndex(reference => !reference);
+      if (invalidIndex >= 0) {
+        return { status: 400, body: { error: `第 ${invalidIndex + 1} 张参考图格式无效` } };
+      }
       const form = new FormData();
       form.set("model", model);
       form.set("prompt", prompt);
       if (input.size && input.size !== "auto") form.set("size", input.size);
       if (input.quality && input.quality !== "auto") form.set("quality", input.quality);
-      form.append("image", converted.blob, `reference.${converted.mimeType.split("/")[1] || "png"}`);
+      convertedReferences.forEach((converted, index) => {
+        if (!converted) return;
+        const fieldName = convertedReferences.length > 1 ? "image[]" : "image";
+        form.append(fieldName, converted.blob, `reference-${index + 1}.${converted.mimeType.split("/")[1] || "png"}`);
+      });
       body = form;
     } else {
       headers["Content-Type"] = "application/json";
@@ -365,16 +375,8 @@ async function runImageGeneration(input: ImageGenerationRequest): Promise<{ stat
     }
 
     if (extracted.kind === "url") {
-      // Preserve a completed generation even when downloading the CDN result fails.
-      try {
-        const downloaded = await fetchImageUrl(extracted.url);
-        return { status: 200, body: { ...downloaded, revisedPrompt: extracted.revisedPrompt } };
-      } catch {
-        return { status: 502, body: {
-          error: "图片已生成，但服务端下载失败", generationCompleted: true,
-          imageUrl: extracted.url, revisedPrompt: extracted.revisedPrompt,
-        } };
-      }
+      const downloaded = await fetchImageUrl(extracted.url);
+      return { status: 200, body: { ...downloaded, revisedPrompt: extracted.revisedPrompt } };
     }
 
     return {

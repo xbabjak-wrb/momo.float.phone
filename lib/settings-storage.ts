@@ -2,7 +2,6 @@ import type {
     GenerationParameterKey,
     PresetConfig,
     WorldBookConfig,
-    WorldBookFolder,
     WorldBookEntry,
     RegexConfig,
     RegexRule,
@@ -18,7 +17,7 @@ import type {
 } from "./settings-types";
 import type { UserIdentity } from "@/components/settings/user-identity";
 import { createBuiltinPreset, BUILTIN_PRESET_VERSION } from "./builtin-preset";
-import { normalizeFaceCrop } from "./face-crop";
+import { createBuiltinAppPrompts } from "./builtin-app-prompts";
 import {
     NOVELAI_DEFAULT_MODEL,
     NOVELAI_DEFAULT_NOISE_SCHEDULE,
@@ -178,6 +177,27 @@ function preserveCustomAppPresetPrompts(fresh: PresetConfig, previous: PresetCon
     };
 }
 
+/**
+ * 内置 APP 的提示词条目按需补齐：只追加缺失项并插入到 shortTermMemory 之前，
+ * 不覆盖用户已修改的内容，也不升 BUILTIN_PRESET_VERSION（升版本会冲掉用户自定义）。
+ */
+function mergeMissingBuiltinAppPrompts(existing: PresetConfig): PresetConfig {
+    const freshPrompts = createBuiltinAppPrompts();
+    const existingIds = new Set((existing.prompts ?? []).map(prompt => prompt.identifier));
+    const missing = freshPrompts.filter(prompt => !existingIds.has(prompt.identifier));
+    if (missing.length === 0) return existing;
+
+    const order = [...(existing.prompt_order ?? [])];
+    let cursor = order.findIndex(entry => entry.identifier === "shortTermMemory" || entry.identifier === "chatHistory");
+    if (cursor < 0) cursor = order.length;
+    for (const prompt of missing) {
+        if (order.some(entry => entry.identifier === prompt.identifier)) continue;
+        order.splice(cursor, 0, { identifier: prompt.identifier, enabled: true });
+        cursor += 1;
+    }
+    return { ...existing, prompts: [...(existing.prompts ?? []), ...missing], prompt_order: order };
+}
+
 
 // --- Presets ──────────────────────────────────────────
 
@@ -204,6 +224,16 @@ export function loadPresets(): PresetConfig[] {
             shouldPersistCleanup = false;
         } else if (shouldPersistCleanup) {
             savePresets(presets);
+        }
+
+        // 内置 APP 的提示词条目按需补齐（只追加缺失项，保留用户已改内容）。
+        const builtinPreset = presets.find(p => p.builtIn);
+        if (builtinPreset) {
+            const merged = mergeMissingBuiltinAppPrompts(builtinPreset);
+            if (merged !== builtinPreset) {
+                presets[presets.indexOf(builtinPreset)] = merged;
+                savePresets(presets);
+            }
         }
 
         return presets;
@@ -420,26 +450,6 @@ export function loadWorldBooks(): WorldBookConfig[] {
 export function saveWorldBooks(books: WorldBookConfig[]): void {
     if (typeof window === "undefined") return;
     writeWorldBooksCache(books);
-}
-
-const WORLD_BOOK_FOLDERS_KEY = "settings_worldbook_folders_v1";
-
-export function loadWorldBookFolders(): WorldBookFolder[] {
-    if (typeof window === "undefined") return [];
-    try {
-        const parsed = JSON.parse(kvGet(WORLD_BOOK_FOLDERS_KEY) || "[]") as unknown;
-        if (!Array.isArray(parsed)) return [];
-        return parsed
-            .filter((item): item is WorldBookFolder => Boolean(item && typeof item === "object" && typeof (item as WorldBookFolder).id === "string" && typeof (item as WorldBookFolder).name === "string"))
-            .sort((left, right) => left.order - right.order || left.createdAt - right.createdAt);
-    } catch {
-        return [];
-    }
-}
-
-export function saveWorldBookFolders(folders: WorldBookFolder[]): void {
-    if (typeof window === "undefined") return;
-    kvSet(WORLD_BOOK_FOLDERS_KEY, JSON.stringify(folders));
 }
 
 export function createWorldBook(name: string): WorldBookConfig {
@@ -716,16 +726,14 @@ export const DEFAULT_IMAGE_GENERATION_SETTINGS: ImageGenerationSettings = {
     size: "1024x1024",
     quality: "auto",
     extraPrompt: "",
+    referenceImageMode: "multi",
     novelai: {
         apiKey: "",
         requestMode: "direct",
-        customUrlEnabled: false,
-        customUrl: "",
         activePresetId: DEFAULT_NOVELAI_PRESET.id,
         presets: [DEFAULT_NOVELAI_PRESET],
     },
     characterReferences: {},
-    userReferences: {},
     imageHosting: {
         provider: "none",
         imgbbApiKey: "",
@@ -774,48 +782,23 @@ function normalizeImageGenerationSettings(settings: Partial<ImageGenerationSetti
         : {};
     const refs: ImageGenerationSettings["characterReferences"] = {};
     for (const [characterId, rawRef] of Object.entries(rawRefs)) {
+        if (characterId === "__group__") continue;
         if (!rawRef || typeof rawRef !== "object") continue;
         const crop = rawRef.faceCrop;
+        const size = crop && typeof crop.size === "number" ? Math.max(0.18, Math.min(1, crop.size)) : 0.46;
         refs[characterId] = {
             assetId: typeof rawRef.assetId === "string" && rawRef.assetId ? rawRef.assetId : undefined,
             updatedAt: typeof rawRef.updatedAt === "number" ? rawRef.updatedAt : Date.now(),
             featurePrompt: typeof rawRef.featurePrompt === "string" ? rawRef.featurePrompt : "",
-            novelAiFeaturePromptEnabled: rawRef.novelAiFeaturePromptEnabled !== false,
             enabled: rawRef.enabled !== false,
             selfieOnly: rawRef.selfieOnly !== false,
-            faceCrop: normalizeFaceCrop(crop),
-            anchors: Array.isArray(rawRef.anchors)
-                ? rawRef.anchors.flatMap((anchor, index) => {
-                    if (!anchor || typeof anchor !== "object") return [];
-                    const category = anchor.category === "accessory" || anchor.category === "clothing"
-                        || anchor.category === "feature" || anchor.category === "other"
-                        ? anchor.category
-                        : "other";
-                    return [{
-                        id: typeof anchor.id === "string" && anchor.id ? anchor.id : `anchor_${characterId}_${index}`,
-                        name: typeof anchor.name === "string" ? anchor.name : "未命名锚点",
-                        category,
-                        description: typeof anchor.description === "string" ? anchor.description : "",
-                        assetId: typeof anchor.assetId === "string" && anchor.assetId ? anchor.assetId : undefined,
-                        enabled: anchor.enabled !== false,
-                        updatedAt: typeof anchor.updatedAt === "number" ? anchor.updatedAt : Date.now(),
-                    }];
-                })
-                : [],
-        };
-    }
-    const rawUserRefs = settings?.userReferences && typeof settings.userReferences === "object"
-        ? settings.userReferences
-        : {};
-    const userReferences: NonNullable<ImageGenerationSettings["userReferences"]> = {};
-    for (const [identityId, rawRef] of Object.entries(rawUserRefs)) {
-        if (!rawRef || typeof rawRef !== "object") continue;
-        const crop = rawRef.faceCrop;
-        userReferences[identityId] = {
-            assetId: typeof rawRef.assetId === "string" && rawRef.assetId ? rawRef.assetId : undefined,
-            updatedAt: typeof rawRef.updatedAt === "number" ? rawRef.updatedAt : Date.now(),
-            enabled: rawRef.enabled !== false,
-            faceCrop: normalizeFaceCrop(crop),
+            faceCrop: crop && typeof crop.x === "number" && typeof crop.y === "number"
+                ? {
+                    x: Math.max(0, Math.min(1, crop.x)),
+                    y: Math.max(0, Math.min(1, crop.y)),
+                    size,
+                }
+                : { x: 0.27, y: 0.12, size: 0.46 },
         };
     }
     const provider = settings?.provider === "novelai" ? "novelai" : "openai";
@@ -854,7 +837,7 @@ function normalizeImageGenerationSettings(settings: Partial<ImageGenerationSetti
     const activeOpenAiPreset = openaiPresets.find(preset => preset.id === activeOpenAiPresetId) || openaiPresets[0];
 
     const rawNai = settings?.novelai;
-    let naiPresets = Array.isArray(rawNai?.presets) && rawNai.presets.length > 0
+    const naiPresets = Array.isArray(rawNai?.presets) && rawNai.presets.length > 0
         ? rawNai.presets.map((p, idx) => normalizeNovelAiPreset(p, idx))
         : [DEFAULT_NOVELAI_PRESET];
     let activePresetId = typeof rawNai?.activePresetId === "string" ? rawNai.activePresetId : naiPresets[0].id;
@@ -867,8 +850,6 @@ function normalizeImageGenerationSettings(settings: Partial<ImageGenerationSetti
         requestMode: rawNai?.requestMode === "server" || rawNai?.requestMode === "direct"
             ? rawNai.requestMode
             : requestMode,
-        customUrlEnabled: rawNai?.customUrlEnabled === true,
-        customUrl: typeof rawNai?.customUrl === "string" ? rawNai.customUrl.trim() : "",
         activePresetId,
         presets: naiPresets,
     };
@@ -888,7 +869,6 @@ function normalizeImageGenerationSettings(settings: Partial<ImageGenerationSetti
         activeOpenAiPresetId,
         novelai,
         characterReferences: refs,
-        userReferences,
         imageHosting: {
             ...DEFAULT_IMAGE_GENERATION_SETTINGS.imageHosting,
             ...hosting,
@@ -1173,9 +1153,6 @@ type LegacyOverride = {
 // --- Follow-up Config ──────────────────────────────────────────
 
 export type FollowUpConfig = {
-    /** 开启后默认关闭所有角色追发，仅 allowCharacterIds 中的角色例外。 */
-    disableAllCharacters: boolean;
-    allowCharacterIds: string[];
     prompt: string;              // 追发提示词，支持 {{count}} {{delay}} 占位符
     anxietyThreshold: number;    // 触发阈值（默认 50，0-100）
     anxietyFieldName: string;    // 状态值字段名（默认 "焦虑值"）
@@ -1194,8 +1171,6 @@ const DEFAULT_FOLLOW_UP_PROMPT = `你已经在未收到{{user}}回复的情况�
 
 export function getDefaultFollowUpConfig(): FollowUpConfig {
     return {
-        disableAllCharacters: false,
-        allowCharacterIds: [],
         prompt: DEFAULT_FOLLOW_UP_PROMPT,
         anxietyThreshold: 50,
         anxietyFieldName: "焦虑值",
@@ -1218,10 +1193,6 @@ export function loadFollowUpConfig(): FollowUpConfig {
         const parsed = JSON.parse(raw) as Partial<FollowUpConfig>;
         const defaults = getDefaultFollowUpConfig();
         return {
-            disableAllCharacters: parsed.disableAllCharacters === true,
-            allowCharacterIds: Array.isArray(parsed.allowCharacterIds)
-                ? Array.from(new Set(parsed.allowCharacterIds.filter((id): id is string => typeof id === "string" && !!id.trim()).map(id => id.trim())))
-                : defaults.allowCharacterIds,
             prompt: typeof parsed.prompt === "string" && parsed.prompt.trim() ? parsed.prompt : defaults.prompt,
             anxietyThreshold: typeof parsed.anxietyThreshold === "number" ? Math.max(0, Math.min(100, parsed.anxietyThreshold)) : defaults.anxietyThreshold,
             anxietyFieldName: typeof parsed.anxietyFieldName === "string" && parsed.anxietyFieldName.trim() ? parsed.anxietyFieldName : defaults.anxietyFieldName,

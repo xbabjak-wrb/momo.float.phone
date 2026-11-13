@@ -10,8 +10,8 @@ import {
 } from "./settings-storage";
 import type { ApiConfig, PresetConfig, RegexConfig, WorldBookConfig } from "./settings-types";
 import { assemblePromptPayload, type LLMMessage } from "./llm-prompt-assembler";
-import { previewMessagesForApi, sendLLMRequestPreferStream, sendLLMStreamRequest, ChatEngineError } from "./chat-engine";
-import { loadMemoryConfig } from "./memory-storage";
+import { previewMessagesForApi, sendLLMRequest, ChatEngineError } from "./chat-engine";
+import { loadMemoryConfig, loadMemoryEntriesByType } from "./memory-storage";
 import { retrieveCoreMemoriesForPrompt, retrieveMemoriesForPrompt } from "./memory-service";
 import { formatCoreMemories, formatLongTermMemories } from "./memory-injector";
 import { prepareShortTermContext } from "./short-term-assembler";
@@ -19,11 +19,9 @@ import { buildCalendarScheduleMarker, getCurrentCalendarScheduleForPrompt } from
 import { getWeekStartIso } from "./calendar-utils";
 import { parseStoryResponse } from "./story-parser";
 import { STORY_PARSER_VERSION } from "./story-parser";
-import { loadStoryMessages, replaceStoryMessages, resolveActiveStorySchemes, type StoryCharacterSettings, type StoryGlobalSettings, type StoryMessage } from "./story-storage";
+import { loadStoryMessages, replaceStoryMessages, resolveActiveStorySchemes, loadStorySessionsForOwner, resolveStoryMemorySettings, type StoryCharacterSettings, type StoryMessage, type StoryMemorySettings } from "./story-storage";
 import type { ChatMessage } from "./chat-storage";
 import { MacroEngine } from "./macro-engine";
-import { formatCharacterRelationsForPrompt } from "./character-world-storage";
-import { formatPromptTimestamp } from "./prompt-time";
 
 const DEFAULT_STORY_FOLD_TAGS = "think,thinking,summary,story_status,story_theater";
 const DEFAULT_STORY_CONTEXT_EXCLUDED_TAGS = "think,thinking,story_theater";
@@ -37,24 +35,10 @@ const STORY_VOICE_FORMAT_PROMPT = `# 剧情正文格式
 - 对白标点唯一格式：无论用户或历史消息里的对话使用什么标点形式（“”、""、『』、''等），你输出的角色对白一律使用「」，不要模仿用户的标点。
 旁白、动作以及用户的话不得写进「」；不要解释这些格式，也不要输出额外的语音清单。`;
 
-function buildStoryBodyFormatPrompt(settings?: StoryCharacterSettings): string {
-  let prompt = STORY_VOICE_FORMAT_PROMPT;
-  if (settings?.innerThoughtGenerationEnabled === true) {
-    prompt = prompt.replace("- *心声*：包裹角色没有说出口的内心想法。",
-      "- *心声*：请结合在场角色的人设、经历和当前情境，自然补充适量未说出口的心理描写，用单个星号包裹为 *心声内容*。只描写角色，不替用户编造心理或决定；按剧情需要适量使用，保留正常的旁白、动作和对白。");
-  }
-  if (settings?.emphasisGenerationEnabled === true) {
-    prompt = prompt.replace("- ~强调~：只强调需要突出的短语。",
-      "- **重点**：请结合当前剧情，适量选出重要的情绪、动作或句子，用双星号包裹为 **重点内容**。避免整段加粗，避免反复强调同一句话。");
-  }
-  return prompt;
-}
-
 export type StoryGenerationOptions = {
   sessionFoldTags?: string;
   sessionContextExcludedTags?: string;
   settings?: StoryCharacterSettings;
-  globalSettings?: StoryGlobalSettings;
   floatingChatContext?: string;
   /** 多人剧情角色列表；第一个角色仍作为 API、预设和语音绑定的主角色。 */
   participantIds?: string[];
@@ -62,10 +46,11 @@ export type StoryGenerationOptions = {
     independent?: boolean;
     inheritRecentMemory?: boolean;
     startedAt?: string;
+    sessionId?: string;
+    ownerType?: "single" | "group";
+    ownerId?: string;
+    memorySettings?: StoryMemorySettings;
   };
-  /** 仅本次重试生效的隐藏额外要求，不写入剧情消息。 */
-  retryInstruction?: string;
-  onDelta?: (text: string) => void;
   signal?: AbortSignal;
 };
 
@@ -79,38 +64,29 @@ function selectStoryPresetPrompts(preset: PresetConfig | null, selectedIds?: str
   };
 }
 
-function buildStorySettingsPrompt(
-  settings: StoryCharacterSettings | undefined,
-  userName: string,
-  globalSettings?: StoryGlobalSettings,
-  now = new Date(),
-): string {
-  const effective = settings || {};
+function buildStorySettingsPrompt(settings: StoryCharacterSettings | undefined, userName: string): string {
+  if (!settings) return "";
   // 字数收敛到 50–10000：用户存 0/负数按 50 生效，超过 10000 按 10000 生效
-  const minChars = Math.max(50, Math.min(10000, effective.minChars ?? 800));
-  const maxChars = Math.max(minChars, Math.min(10000, effective.maxChars ?? 1500));
-  const perspective = effective.userPerspective === "third"
+  const minChars = Math.max(50, Math.min(10000, settings.minChars ?? 800));
+  const maxChars = Math.max(minChars, Math.min(10000, settings.maxChars ?? 1500));
+  const perspective = settings.userPerspective === "third"
     ? "使用第三人称“TA”称呼用户"
-    : effective.userPerspective === "username"
+    : settings.userPerspective === "username"
       ? `使用用户名“${userName}”称呼用户`
       : "使用第二人称“你”称呼用户";
   // 方案定义统一存于公用仓库，角色设置只带“启用哪一个”的 id
-  const { proseStyle, status, theater } = resolveActiveStorySchemes(effective);
-  const proseRequirement = proseStyle?.prompt?.trim()
-    ? `采用【${proseStyle.name}】文风：${proseStyle.prompt.trim()}`
-    : (effective.proseStylePrompt?.trim() || effective.proseStyle?.trim() || "自然、连贯地推进剧情");
+  const { proseStyle, status, theater } = resolveActiveStorySchemes(settings);
   return [
-    "# 最高优先级：本轮剧情输出要求",
-    `1. 人称：${perspective}。`,
-    `2. 文风：${proseRequirement}`,
-    `3. 字数：正文以 ${minChars}—${maxChars} 字为目标；不得为了凑字数重复内容。`,
-    globalSettings?.timeAware !== false ? `4. 时间感知：当前时间为 ${formatPromptTimestamp(now.toISOString()) || now.toLocaleString()}，请正确理解时间先后、间隔和昼夜，不要虚构冲突时间。` : "",
-    "输出前请静默检查人称、文风和字数是否全部满足，不要展示检查过程。",
+    "# 当前剧情 APP 专属生成设置",
+    `正文长度以 ${minChars}—${maxChars} 字为目标；不得为了凑字数重复内容。`,
+    perspective + "。",
     // 新建方案 prompt 留空时不注入（避免出现“文风方案【xxx】：”这样的空行）
-    effective.extraPrompt?.trim() ? `额外要求：${effective.extraPrompt.trim()}` : "",
-    ...(effective.customPromptEntries || []).filter((item) => item.enabled && item.content.trim()).map((item) => `专属条目【${item.name || "未命名"}】：${item.content.trim()}`),
-    effective.statusGenerationEnabled !== false ? (status?.prompt?.trim() || "") : "",
-    effective.theaterGenerationEnabled !== false ? (theater?.prompt?.trim() || "") : "",
+    proseStyle?.prompt?.trim() ? `正文文风方案【${proseStyle.name}】（仅约束写作风格，不是尾部输出格式）：${proseStyle.prompt.trim()}` : (settings.proseStyle ? `文风：${settings.proseStyle}。` : ""),
+    proseStyle?.prompt?.trim() ? "" : (settings.proseStylePrompt?.trim() || ""),
+    settings.extraPrompt?.trim() || "",
+    ...(settings.customPromptEntries || []).filter((item) => item.enabled && item.content.trim()).map((item) => `专属条目【${item.name || "未命名"}】：${item.content.trim()}`),
+    status?.prompt?.trim() || "",
+    theater?.prompt?.trim() || "",
   ].filter(Boolean).join("\n");
 }
 
@@ -149,7 +125,7 @@ function toHistoryMessage(message: StoryMessage, contextExcludedTags?: string): 
   return {
     id: message.id,
     sessionId: message.sessionId,
-    role: message.contextRole || message.role,
+    role: message.role,
     content: stripContextExcludedTags(message.rawContent, contextExcludedTags),
     status: "sent",
     createdAt: message.createdAt,
@@ -212,22 +188,6 @@ function resolveStoryConfigs(characterId: string): {
   };
 }
 
-function mergeParticipantWorldBooks(base: WorldBookConfig[], participantIds?: string[]): WorldBookConfig[] {
-  const ids = Array.from(new Set(participantIds || [])).filter(Boolean);
-  if (ids.length <= 1) return base;
-  const bindings = loadBindingConfig();
-  const allWorldBooks = loadWorldBooks();
-  const merged = new Map(base.map((book) => [book.id, book]));
-  for (const id of ids) {
-    const slot = resolveBinding(bindings, id, "story");
-    for (const worldBookId of slot.worldBookIds || []) {
-      const book = allWorldBooks.find((item) => item.id === worldBookId);
-      if (book) merged.set(book.id, book);
-    }
-  }
-  return [...merged.values()];
-}
-
 export function getStoryRenderSignature(characterId: string): { regexSignature: string; parserVersion: number; regexes: RegexConfig[] } {
   const { regexSignature, regexes } = resolveStoryConfigs(characterId);
   return {
@@ -259,48 +219,17 @@ export async function generateStoryCompletion(
     worldBooks,
     effectiveContextExcludedTags,
     options?.settings,
-    options?.globalSettings,
     options?.floatingChatContext,
     options?.participantIds,
     options?.storyMemory,
   );
-  if (options?.retryInstruction?.trim()) {
-    llmMessages.push({
-      role: "system",
-      content: `【本次重新生成额外要求】\n${options.retryInstruction.trim()}\n只在本次重新生成中遵守；不要复述、解释或向用户展示这段隐藏要求。`,
-    });
-  }
 
   const userIdentity = resolveUserIdentity(characterId, "story");
   const macroEngine = new MacroEngine(character.name, userIdentity?.name ?? "用户");
 
-  let rawOutput: string;
-  if (options?.globalSettings?.streamingEnabled) {
-    let receivedDelta = false;
-    try {
-      const streamed = await sendLLMStreamRequest(apiConfig, preset, llmMessages, regexes, {
-        characterName: character.name,
-      }, { skipOutputRegex: true, includeReasoning: true, appId: "story", appTags: ["story"], signal: options?.signal }, {
-        onDelta: (text) => {
-          receivedDelta = true;
-          options.onDelta?.(text);
-        },
-      });
-      rawOutput = streamed.content;
-    } catch (error) {
-      // 某些中转只是不支持 SSE：在尚未吐出任何正文时安全回退普通生成；
-      // 已经吐过增量则不重试，避免一次操作生成两份互相不同的正文。
-      if (receivedDelta || options.signal?.aborted) throw error;
-      rawOutput = await sendLLMRequestPreferStream(apiConfig, preset, llmMessages, regexes, {
-        characterName: character.name,
-      }, { skipOutputRegex: true, includeReasoning: true, appId: "story", appTags: ["story"], signal: options?.signal });
-    }
-  } else {
-    // 关闭逐字显示时仍优先使用流式传输，在后台收齐全文后一次性展示，避免 iOS 长请求超时。
-    rawOutput = await sendLLMRequestPreferStream(apiConfig, preset, llmMessages, regexes, {
-      characterName: character.name,
-    }, { skipOutputRegex: true, includeReasoning: true, appId: "story", appTags: ["story"], signal: options?.signal });
-  }
+  const rawOutput = await sendLLMRequest(apiConfig, preset, llmMessages, regexes, {
+    characterName: character.name,
+  }, { skipOutputRegex: true, includeReasoning: true, appId: "story", appTags: ["story"], signal: options?.signal });
 
   const parsed = parseStoryResponse(rawOutput, regexes, {
     summaryTag,
@@ -328,7 +257,6 @@ async function buildStoryPromptMessages(
   worldBooks: WorldBookConfig[],
   contextExcludedTags: string = DEFAULT_STORY_CONTEXT_EXCLUDED_TAGS,
   settings?: StoryCharacterSettings,
-  globalSettings?: StoryGlobalSettings,
   floatingChatContext?: string,
   participantIds?: string[],
   storyMemory?: StoryGenerationOptions["storyMemory"],
@@ -339,38 +267,90 @@ async function buildStoryPromptMessages(
   }
 
   const userIdentity = resolveUserIdentity(characterId, "story");
-  const allCharacters = loadCharacters();
-  const participantCharacters = Array.from(new Set([characterId, ...(participantIds || [])]))
-    .map((id) => allCharacters.find((item) => item.id === id))
-    .filter((item): item is NonNullable<typeof item> => Boolean(item));
-  const effectiveWorldBooks = mergeParticipantWorldBooks(worldBooks, participantCharacters.map((item) => item.id));
-  const isEnsemble = participantCharacters.length > 1;
   const historyMessages = history.map((message) => toHistoryMessage(message, contextExcludedTags));
   const memConfig = loadMemoryConfig();
-  const independent = Boolean(storyMemory?.independent);
-  const timeAware = globalSettings?.timeAware !== false;
-  const context = independent
-    ? {
+  const memorySettings = storyMemory?.memorySettings
+    ? { ...resolveStoryMemorySettings(), ...storyMemory.memorySettings }
+    : resolveStoryMemorySettings({ independentStory: storyMemory?.independent });
+  // 分线自己的完整聊天历史始终进入上下文；各开关只控制外部记忆来源。
+  const usePublicShortTerm = memorySettings.readPublicShortTermMemory || memorySettings.readOtherAppsMemory;
+  const context = usePublicShortTerm
+    ? prepareShortTermContext(characterId, "story", {
+      userName: userIdentity?.name ?? "用户",
+      history: historyMessages,
+      afterTimestamp: !storyMemory?.memorySettings && storyMemory?.inheritRecentMemory === false ? storyMemory.startedAt : undefined,
+      includeOtherApps: memorySettings.readOtherAppsMemory,
+      includeStoryPublic: memorySettings.readPublicShortTermMemory,
+    })
+    : {
       recentBlocks: [],
       truncatedHistory: historyMessages,
       wbActivationContext: historyMessages.slice(-10).map((message) => message.content).join("\n"),
       unifiedRecentItems: [],
-    }
-    : prepareShortTermContext(characterId, "story", {
-      userName: userIdentity?.name ?? "用户",
-      history: historyMessages,
-      afterTimestamp: storyMemory?.inheritRecentMemory === false ? storyMemory.startedAt : undefined,
-      timeAware,
-    });
+    };
   const { recentBlocks, truncatedHistory, wbActivationContext, unifiedRecentItems } = context;
 
   let memories: Awaited<ReturnType<typeof retrieveMemoriesForPrompt>> | null = null;
   let coreMemories: Awaited<ReturnType<typeof retrieveCoreMemoriesForPrompt>> | null = null;
-  if (!independent) {
-    [memories, coreMemories] = await Promise.all([
-      retrieveMemoriesForPrompt(characterId, wbActivationContext, memConfig).catch(() => null),
-      retrieveCoreMemoriesForPrompt(characterId, memConfig).catch(() => null),
-    ]);
+  [memories, coreMemories] = await Promise.all([
+    memorySettings.readLongTermMemory
+      ? retrieveMemoriesForPrompt(characterId, wbActivationContext, memConfig).catch(() => null)
+      : Promise.resolve(null),
+    memorySettings.readCoreMemory
+      ? retrieveCoreMemoriesForPrompt(characterId, memConfig).catch(() => null)
+      : Promise.resolve(null),
+  ]);
+
+  // 分线间共享必须同时满足“本分线允许读取”与“来源分线允许被读取”，并按 session id 精确授权。
+  let sharedBranchContext = "";
+  if (memorySettings.readOtherBranchMemory && storyMemory?.sessionId && storyMemory.ownerId) {
+    const allowedIds = new Set(memorySettings.readableBranchIds || []);
+    const siblingSessions = loadStorySessionsForOwner(storyMemory.ownerType || "single", storyMemory.ownerId)
+      .filter((session) => session.id !== storyMemory.sessionId && allowedIds.has(session.id));
+    const snippets: string[] = [];
+    for (const sibling of siblingSessions) {
+      const siblingSettings = resolveStoryMemorySettings(sibling);
+      if (!siblingSettings.allowOtherBranchesRead) continue;
+      const label = sibling.branchName || "未命名分线";
+
+      if (siblingSettings.sharedMemoryTypes.includes("branch") && siblingSettings.writeBranchMemory) {
+        const branchSummary = loadStoryMessages(sibling.id)
+          .filter((message) => message.role === "assistant" && Boolean(
+            message.branchMemorySummary !== undefined
+              ? message.branchMemorySummary
+              : sibling.memorySettings?.writeBranchMemory !== false ? message.storySummary : "",
+          ))
+          .slice(-12)
+          .map((message) => (message.branchMemorySummary !== undefined
+            ? message.branchMemorySummary
+            : sibling.memorySettings?.writeBranchMemory !== false ? message.storySummary : "")?.trim())
+          .filter((value): value is string => Boolean(value));
+        if (branchSummary.length) snippets.push(`【分线摘要：${label}】\n${branchSummary.join("\n")}`);
+      }
+
+      if (siblingSettings.sharedMemoryTypes.includes("public_short_term") && siblingSettings.writePublicShortTermMemory) {
+        const publicSummary = loadStoryMessages(sibling.id)
+          .filter((message) => message.role === "assistant" && Boolean(message.storySummary))
+          .slice(-12)
+          .map((message) => message.storySummary?.trim())
+          .filter((value): value is string => Boolean(value));
+        if (publicSummary.length) snippets.push(`【分线公共短期事件：${label}】\n${publicSummary.join("\n")}`);
+      }
+
+      const belongsExclusivelyToSibling = (entry: { metadata?: Record<string, unknown> }) => {
+        const ids = Array.isArray(entry.metadata?.sourceSessionIds) ? entry.metadata?.sourceSessionIds.map(String) : [];
+        return ids.length === 1 && ids[0] === sibling.id;
+      };
+      if (siblingSettings.sharedMemoryTypes.includes("long_term") && siblingSettings.writeLongTermMemory) {
+        const entries = (await loadMemoryEntriesByType(characterId, "long_term")).filter(belongsExclusivelyToSibling);
+        if (entries.length) snippets.push(`【分线长期记忆：${label}】\n${entries.slice(-8).map((entry) => entry.content).join("\n")}`);
+      }
+      if (siblingSettings.sharedMemoryTypes.includes("core") && siblingSettings.writeCoreMemory) {
+        const entries = (await loadMemoryEntriesByType(characterId, "core")).filter(belongsExclusivelyToSibling);
+        if (entries.length) snippets.push(`【分线核心记忆：${label}】\n${entries.slice(-8).map((entry) => entry.content).join("\n")}`);
+      }
+    }
+    sharedBranchContext = snippets.join("\n\n");
   }
 
   const now = new Date();
@@ -379,114 +359,58 @@ async function buildStoryPromptMessages(
     character,
     history: truncatedHistory,
     preset,
-    worldBooks: effectiveWorldBooks,
+    worldBooks,
     regexes,
     userIdentity,
     appId: "story",
-    scheduleSummary: independent || isEnsemble ? undefined : buildCalendarScheduleMarker("character", characterId, getWeekStartIso(now)),
-    currentSchedule: independent || isEnsemble ? undefined : getCurrentCalendarScheduleForPrompt("character", characterId, now),
-    coreMemories: !isEnsemble && coreMemories ? formatCoreMemories(coreMemories) : "",
-    longTermMemories: !isEnsemble && memories ? formatLongTermMemories(memories) : "",
+    scheduleSummary: buildCalendarScheduleMarker("character", characterId, getWeekStartIso(now)),
+    currentSchedule: getCurrentCalendarScheduleForPrompt("character", characterId, now),
+    coreMemories: coreMemories ? formatCoreMemories(coreMemories) : "",
+    longTermMemories: memories ? formatLongTermMemories(memories) : "",
     worldBookActivationContext: wbActivationContext,
-    recentBlocks: isEnsemble ? [] : recentBlocks,
-    unifiedRecentItems: isEnsemble ? [] : unifiedRecentItems,
-    timeAware,
-    characterRelations: independent || isEnsemble ? null : undefined,
-    dwellingContext: independent || isEnsemble ? null : undefined,
+    recentBlocks,
+    unifiedRecentItems,
   });
-  const settingsPrompt = buildStorySettingsPrompt(settings, userIdentity?.name ?? "用户", globalSettings, now);
+  const settingsPrompt = buildStorySettingsPrompt(settings, userIdentity?.name ?? "用户");
+  const participantCharacters = Array.from(new Set(participantIds || []))
+    .map((id) => loadCharacters().find((item) => item.id === id))
+    .filter((item): item is NonNullable<typeof item> => Boolean(item));
   if (participantCharacters.length > 1) {
-    const participantContexts = await Promise.all(participantCharacters.map(async (item) => {
-      const identity = resolveUserIdentity(item.id, "story");
-      if (independent) {
-        return { item, identity, recent: "", core: "", longTerm: "", schedule: "", relations: "" };
-      }
-      const localContext = item.id === characterId
-        ? context
-        : prepareShortTermContext(item.id, "story", {
-          userName: identity?.name ?? userIdentity?.name ?? "用户",
-          history: historyMessages,
-          afterTimestamp: storyMemory?.inheritRecentMemory === false ? storyMemory.startedAt : undefined,
-          timeAware,
-        });
-      const [localLongTerm, localCore] = item.id === characterId
-        ? [memories, coreMemories]
-        : await Promise.all([
-          retrieveMemoriesForPrompt(item.id, localContext.wbActivationContext, memConfig).catch(() => null),
-          retrieveCoreMemoriesForPrompt(item.id, memConfig).catch(() => null),
-        ]);
-      const recent = localContext.recentBlocks
-        .filter((block) => Boolean(block.content.trim()))
-        .map((block) => `<${block.tag}>\n${block.content.trim()}\n</${block.tag}>`)
-        .join("\n");
-      const schedule = [
-        buildCalendarScheduleMarker("character", item.id, getWeekStartIso(now)),
-        getCurrentCalendarScheduleForPrompt("character", item.id, now),
-      ].filter(Boolean).join("\n");
-      return {
-        item,
-        identity,
-        recent,
-        core: localCore ? formatCoreMemories(localCore) : "",
-        longTerm: localLongTerm ? formatLongTermMemories(localLongTerm) : "",
-        schedule,
-        relations: formatCharacterRelationsForPrompt(item.id),
-      };
-    }));
-    const roster = participantContexts.map(({ item, recent, core, longTerm, schedule, relations }, index) => [
-      `## 角色 ${index + 1}：${item.name}`,
-      `完整人设：${item.persona?.trim() || "（未填写）"}`,
-      item.personality?.trim() ? `性格：${item.personality.trim()}` : "",
-      item.briefPersona?.trim() ? `关系简介：${item.briefPersona.trim()}` : "",
-      schedule ? `当前日程：\n${schedule}` : "",
-      relations ? `关系网：\n${relations}` : "",
-      core ? `核心记忆：\n${core}` : "",
-      longTerm ? `长期记忆：\n${longTerm}` : "",
-      recent ? `近期事件：\n${recent}` : "",
-    ].filter(Boolean).join("\n")).join("\n\n");
+    const roster = participantCharacters.map((item, index) => {
+      const profile = item.briefPersona?.trim() || item.personality?.trim() || item.persona?.trim();
+      return `${index + 1}. ${item.name}${profile ? `：${profile}` : ""}`;
+    }).join("\n");
     messages.push({
       role: "system",
-      content: `# 最高优先级：多人群像剧情\n这是平等的多人群像故事，不存在默认主角。API 绑定所使用的第一个角色仅是技术入口，不代表叙事中心。\n\n${roster}\n\n强制叙事规则：\n- 使用中立的第三人称旁白推进整体场景；旁白不得自称“我”。\n- “我”只能出现在某个角色真正说出口的第一人称对白中，且必须能明确判断说话者。\n- 根据现场语境，让每个在场角色都有符合人设的观察、动作、反应或对白；不要求机械轮流说话，但不得长期由一个角色垄断叙事。\n- 不得把多人合并成同一个人格，不得让第一个角色替其他人思考，也不要替用户决定心理或行动。`,
+      content: `# 多人见面剧情\n当前场景共有以下角色：\n${roster}\n请让每个角色保持各自人设、称呼和行动逻辑，按场景自然分配对白与反应；不要把多人合并成同一个说话者，也不要代替用户决定行动。`,
     });
   }
-  if (independent) {
-    messages.push({ role: "system", content: "# 独立剧情隔离规则\n本分线只使用角色基础设定、已绑定世界书和本分线内已经发生的内容。不得读取或推断角色短期记忆、核心记忆、长期记忆、日程、关系网、住宅状态、线上私聊/群聊、悬浮小手机内容或其他剧情分线。世界书属于世界设定，仍然有效。" });
+  if (sharedBranchContext.trim()) {
+    messages.push({ role: "system", content: `# 获准读取的其他剧情分线记忆\n以下仅为用户明确选择且对方允许共享的分线摘要；不得把它们当作当前分线已经亲历的事实：\n${sharedBranchContext}` });
+  }
+  if (!memorySettings.readCoreMemory && !memorySettings.readLongTermMemory && !memorySettings.readPublicShortTermMemory && !sharedBranchContext) {
+    messages.push({ role: "system", content: "# 分线记忆隔离\n本分线不读取角色公共核心、长期或短期记忆；只根据角色设定与本分线自身聊天历史继续。" });
   }
   if (settingsPrompt) messages.push({ role: "system", content: settingsPrompt });
-  if (!independent && settings?.floatingPhoneInContext && floatingChatContext?.trim()) {
+  if (settings?.floatingPhoneInContext && floatingChatContext?.trim()) {
     messages.push({ role: "system", content: `# 悬浮小手机最近线上聊天\n以下记录用于衔接线上与线下剧情，不要逐字复述：\n${floatingChatContext.trim()}` });
   }
-  messages.push({ role: "system", content: buildStoryBodyFormatPrompt(settings) });
+  messages.push({ role: "system", content: STORY_VOICE_FORMAT_PROMPT });
   return messages;
 }
 
 export async function previewStoryPromptPayload(
   characterId: string,
   history: StoryMessage[],
-  options?: Pick<StoryGenerationOptions,
-    "sessionContextExcludedTags" | "settings" | "globalSettings" | "floatingChatContext" | "participantIds" | "storyMemory"
-  >,
+  options?: { sessionContextExcludedTags?: string },
 ): Promise<StoryPreviewResult> {
   const character = loadCharacters().find((item) => item.id === characterId);
   if (!character) {
     throw new ChatEngineError(`Character not found: ${characterId}`);
   }
-  const { apiConfig, preset: resolvedPreset, regexes, worldBooks } = resolveStoryConfigs(characterId);
-  const preset = selectStoryPresetPrompts(resolvedPreset, options?.settings?.enabledPresetPromptIds);
+  const { apiConfig, preset, regexes, worldBooks } = resolveStoryConfigs(characterId);
   const effectiveContextExcludedTags = options?.sessionContextExcludedTags?.trim() || DEFAULT_STORY_CONTEXT_EXCLUDED_TAGS;
-  const llmMessages = await buildStoryPromptMessages(
-    characterId,
-    history,
-    preset,
-    regexes,
-    worldBooks,
-    effectiveContextExcludedTags,
-    options?.settings,
-    options?.globalSettings,
-    options?.floatingChatContext,
-    options?.participantIds,
-    options?.storyMemory,
-  );
+  const llmMessages = await buildStoryPromptMessages(characterId, history, preset, regexes, worldBooks, effectiveContextExcludedTags);
   return {
     messages: previewMessagesForApi(apiConfig, preset, llmMessages),
     characterName: character.name,

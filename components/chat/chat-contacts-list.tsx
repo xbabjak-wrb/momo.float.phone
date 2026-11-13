@@ -1,14 +1,8 @@
 "use client";
 
 import React, { useState, useEffect, useCallback, useRef, useMemo, useDeferredValue, useSyncExternalStore } from "react";
-import { loadChatContacts, ChatContact, createOrGetSession, ChatSession, addChatContact, pushChatMessage, loadChatMessages, resolveChatCharacterAvatar } from "@/lib/chat-storage";
-import {
-    CHAT_SCOPE_UPDATED_EVENT,
-    characterMatchesChatScope,
-    loadChatScope,
-    resolveChatScopeUserIdentity,
-    type ChatScopeState,
-} from "@/lib/chat-scope-storage";
+import { loadChatContacts, ChatContact, createOrGetSession, ChatSession, addChatContact, pushChatMessage, loadChatMessages } from "@/lib/chat-storage";
+import { resolveUserIdentity } from "@/lib/settings-storage";
 import { PENDING_REPLY_PREFIX } from "@/lib/friend-request-engine";
 import { loadCharacters } from "@/lib/character-storage";
 import { Character } from "@/lib/character-types";
@@ -26,8 +20,6 @@ import { pinyin } from "pinyin-pro";
 import { kvSet } from "@/lib/kv-db";
 import { scrollElementWithinContainer } from "@/lib/dom-scroll";
 import { ChatFallbackAvatar } from "./chat-fallback-avatar";
-import { ContactProfilePage } from "./contact-profile-page";
-import { addChatAltAccountFriend, findChatAltAccount } from "@/lib/chat-alt-account-storage";
 import {
     DEFAULT_MASCOT_AVATAR,
     getMascotSettingsSnapshot,
@@ -40,9 +32,6 @@ type ChatContactsListProps = {
     onCloseApp: () => void;
     onSelectSession: (session: ChatSession | null) => void;
     onSelectMascot: () => void;
-    onStartCall?: (session: ChatSession, type: "voice" | "video") => void;
-    onSubpageChange?: (open: boolean) => void;
-    selectForShare?: boolean;
     /** 名片点击「加好友」：切到本 tab 后待打开添加页的角色 id */
     pendingAddContactId?: string | null;
     onPendingAddContactConsumed?: () => void;
@@ -50,8 +39,7 @@ type ChatContactsListProps = {
     onPendingAddContactBack?: () => void;
 };
 
-export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, onStartCall, onSubpageChange, selectForShare = false, pendingAddContactId, onPendingAddContactConsumed, onPendingAddContactBack }: ChatContactsListProps) {
-    const [profileCharacterId, setProfileCharacterId] = useState<string | null>(null);
+export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, pendingAddContactId, onPendingAddContactConsumed, onPendingAddContactBack }: ChatContactsListProps) {
     const [contacts, setContacts] = useState<(ChatContact & { char?: Character })[]>([]);
     const [contactFilter, setContactFilter] = useState("");
     const [latestPost, setLatestPost] = useState<Record<string, string>>({});
@@ -69,17 +57,11 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
     const mascotSettings = useSyncExternalStore(subscribeMascotSettings, getMascotSettingsSnapshot, getMascotSettingsSnapshot);
     const [mascotAvatarUrl, setMascotAvatarUrl] = useState(mascotSettings.avatarImage || DEFAULT_MASCOT_AVATAR);
 
-    const [chatScope, setChatScope] = useState<ChatScopeState>(() => loadChatScope());
-    const identity = resolveChatScopeUserIdentity();
+    const identity = useMemo(() => resolveUserIdentity(), []);
     const chars = useMemo(() => loadCharacters(), []);
     const deferredContactFilter = useDeferredValue(contactFilter);
     const bodyRef = useRef<HTMLDivElement>(null);
     const sectionRefs = useRef<Record<string, HTMLDivElement | null>>({});
-    useEffect(() => {
-        onSubpageChange?.(Boolean(profileCharacterId));
-        return () => onSubpageChange?.(false);
-    }, [profileCharacterId, onSubpageChange]);
-    useEffect(() => { setProfileCharacterId(null); }, [chatScope, selectForShare, pendingAddContactId]);
 
     useEffect(() => {
         let cancelled = false;
@@ -119,18 +101,11 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
     }
 
     const refresh = useCallback(() => {
-        const altAccount = findChatAltAccount(chatScope.chatAccountId);
-        const rawContacts: ChatContact[] = altAccount
-            ? altAccount.friendCharacterIds.map(characterId => ({
-                id: `alt-contact:${altAccount.id}:${characterId}`,
-                characterId,
-                addedAt: altAccount.createdAt,
-            }))
-            : loadChatContacts();
+        const rawContacts = loadChatContacts();
         const enriched = rawContacts.map(c => ({
             ...c,
             char: chars.find(ch => ch.id === c.characterId)
-        })).filter(c => c.char && characterMatchesChatScope(c.characterId, chatScope));
+        })).filter(c => c.char);
         enriched.sort((a, b) => (a.char?.name || "").localeCompare(b.char?.name || ""));
         setContacts(enriched);
 
@@ -141,9 +116,9 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
         }
         setLatestPost(map);
 
-        setPendingRequests(altAccount ? [] : getPendingFriendRequests().filter(request => characterMatchesChatScope(request.characterId, chatScope)));
+        setPendingRequests(getPendingFriendRequests());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [chatScope, chars]);
+    }, []);
 
     useEffect(() => {
         refresh();
@@ -151,18 +126,6 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
         window.addEventListener("friend-requests-updated", handler);
         return () => window.removeEventListener("friend-requests-updated", handler);
     }, [refresh]);
-
-    useEffect(() => {
-        const syncScope = () => setChatScope(loadChatScope());
-        window.addEventListener(CHAT_SCOPE_UPDATED_EVENT, syncScope);
-        window.addEventListener("settings-bindings-updated", syncScope);
-        window.addEventListener("character-worlds-updated", syncScope);
-        return () => {
-            window.removeEventListener(CHAT_SCOPE_UPDATED_EVENT, syncScope);
-            window.removeEventListener("settings-bindings-updated", syncScope);
-            window.removeEventListener("character-worlds-updated", syncScope);
-        };
-    }, []);
 
     /** Group contacts by pinyin initial */
     const { grouped, indexLetters } = useMemo(() => {
@@ -218,26 +181,19 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
     const getCharForRequest = (req: FriendRequest) =>
         chars.find(c => c.id === req.characterId);
 
-    const profileCharacter = contacts.find(contact => contact.characterId === profileCharacterId)?.char;
-    if (profileCharacter) return <ContactProfilePage key={profileCharacter.id} character={profileCharacter}
-        onBack={() => setProfileCharacterId(null)}
-        onMessage={() => onSelectSession(createOrGetSession(profileCharacter.id))}
-        onCall={type => {
-            const session = createOrGetSession(profileCharacter.id);
-            if (onStartCall) onStartCall(session, type); else onSelectSession(session);
-        }} />;
-
     return (
         <div className="relative flex-1 h-full">
             <PageShell
-                title="联系人"
+                title="Contacts"
                 onBack={onCloseApp}
                 bodyRef={bodyRef}
                 rightAction={
                     <button
-                        className="page-back-btn"
+                        className="page-back-btn relative z-[10000] pointer-events-auto touch-manipulation"
+                        style={{ position: "relative", zIndex: 2147483000, pointerEvents: "auto", touchAction: "manipulation" }}
+                        aria-label="添加朋友"
                         type="button"
-                        onClick={() => {
+                        onClick={(event) => { event.preventDefault(); event.stopPropagation();
                             addFromCardRef.current = false;
                             setIsAddFriendOpen(true);
                             setAddQuery("");
@@ -246,7 +202,7 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                             setGreetingText(identity?.name ? `我是${identity.name}` : "你好");
                         }}
                     >
-                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><path d="M12 8v8M8 12h8" /></svg>
+                        <svg className="pointer-events-none" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><path d="M12 8v8M8 12h8" /></svg>
                     </button>
                 }
             >
@@ -254,13 +210,13 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                 {/* Search bar */}
                 <div className="pt-5 pb-1">
                     <div className="flex items-center justify-between mb-4 mt-2">
-                        <span className="ts-28 font-bold text-[var(--c-text-title)]">联系人</span>
+                        <span className="ts-28 font-bold text-[var(--c-text-title)]">Contacts</span>
                     </div>
                     <div className="chat-search-bar">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--c-icon)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
                         <input
                             className="chat-search-input ts-15 w-full bg-transparent outline-none text-[var(--c-text-title)] placeholder:text-[var(--c-icon)]"
-                            placeholder="搜索联系人…"
+                            placeholder="Search contacts..."
                             value={contactFilter}
                             onChange={(e) => setContactFilter(e.target.value)}
                         />
@@ -282,7 +238,7 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                             </svg>
                         </div>
                         <div className="flex-1 overflow-hidden h-[48px] flex flex-col justify-center">
-                            <div className="ts-16 font-medium text-[var(--c-text-title)]">新的朋友</div>
+                            <div className="ts-16 font-medium text-[var(--c-text-title)]">New Friends</div>
                         </div>
                         {pendingRequests.length > 0 && (
                             <div className="minimal-unread-count ml-auto shrink-0">{pendingRequests.length}</div>
@@ -321,14 +277,14 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                                         <div
                                             key={c.id}
                                             onClick={() => {
-                                                if (selectForShare) onSelectSession(createOrGetSession(char.id));
-                                                else setProfileCharacterId(char.id);
+                                                const sess = createOrGetSession(char.id);
+                                                onSelectSession(sess);
                                             }}
                                             className="minimal-list-item"
                                         >
                                             <div className="minimal-avatar-wrapper">
-                                                {resolveChatCharacterAvatar(char) ? (
-                                                    <img src={resolveChatCharacterAvatar(char)} className="w-full h-full object-cover rounded-full" alt="" />
+                                                {char.avatar ? (
+                                                    <img src={char.avatar} className="w-full h-full object-cover rounded-full" alt="" />
                                                 ) : (
                                                     <ChatFallbackAvatar className="rounded-full" />
                                                 )}
@@ -389,8 +345,8 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                                             onClick={() => setSelectedRequest(req)}
                                         >
                                             <div className="freq-avatar">
-                                                {resolveChatCharacterAvatar(char) ? (
-                                                    <img src={resolveChatCharacterAvatar(char)} alt="" />
+                                                {char?.avatar ? (
+                                                    <img src={char.avatar} alt="" />
                                                 ) : (
                                                     <div className="freq-avatar-fallback">
                                                         {(char?.name || "?")[0]}
@@ -428,8 +384,8 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                         <div className="modal-dialog freq-dialog" onClick={e => e.stopPropagation()}>
                             {/* Avatar */}
                             <div className="freq-detail-avatar">
-                                {resolveChatCharacterAvatar(char) ? (
-                                    <img src={resolveChatCharacterAvatar(char)} alt="" />
+                                {char?.avatar ? (
+                                    <img src={char.avatar} alt="" />
                                 ) : (
                                     <div className="freq-avatar-fallback" style={{ fontSize: "calc(28px*var(--app-text-scale,1))" }}>
                                         {(char?.name || "?")[0]}
@@ -473,7 +429,7 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
 
             {/* Add Friend Modal */}
             {isAddFriendOpen && (
-                <div style={{ position: 'absolute', inset: 0, zIndex: 9999, background: '#ffffff' }}>
+                <div style={{ position: 'fixed', inset: 0, zIndex: 2147483000, pointerEvents: 'auto', background: '#ffffff' }}>
                 <div style={{ position: 'absolute', inset: 0, background: 'var(--c-page-body-bg)' }}>
                 <PageShell title="添加朋友" onBack={() => { setIsAddFriendOpen(false); if (addFromCardRef.current) { addFromCardRef.current = false; onPendingAddContactBack?.(); } }}>
                     {!addResult && addResult !== null && (
@@ -498,7 +454,7 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                                     <button
                                         className="menu-item"
                                         onClick={() => {
-                                            const found = chars.find(c => (c.wechatID === addQuery.trim() || c.id === addQuery.trim()) && characterMatchesChatScope(c.id, chatScope));
+                                            const found = chars.find(c => c.wechatID === addQuery.trim() || c.id === addQuery.trim());
                                             setAddResult(found || null);
                                         }}
                                     >
@@ -548,8 +504,8 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                             <div className="menu-group">
                                 <div className="menu-item !items-start">
                                     <div className="add-friend-avatar">
-                                        {resolveChatCharacterAvatar(addResult) ? (
-                                            <img src={resolveChatCharacterAvatar(addResult)} className="w-full h-full object-cover" alt="" />
+                                        {addResult.avatar ? (
+                                            <img src={addResult.avatar} className="w-full h-full object-cover" alt="" />
                                         ) : (
                                             <ChatFallbackAvatar />
                                         )}
@@ -584,13 +540,12 @@ export function ChatContactsList({ onCloseApp, onSelectSession, onSelectMascot, 
                             <div className="flex flex-col gap-3">
                                 <button
                                     onClick={() => {
-                                        if (chatScope.chatAccountId) addChatAltAccountFriend(chatScope.chatAccountId, addResult.id);
-                                        else addChatContact(addResult.id);
+                                        addChatContact(addResult.id);
                                         clearRequestsForCharacter(addResult.id);
                                         dispatchFriendRequestUpdated();
                                         const newSession = createOrGetSession(addResult.id);
                                         const isReAdd = loadChatMessages(newSession.id).length > 0;
-                                        const charIdentity = resolveChatScopeUserIdentity(addResult.id, "chat");
+                                        const charIdentity = resolveUserIdentity(addResult.id, "chat");
                                         const userName = charIdentity?.name || identity?.name || "你";
                                         if (isReAdd) {
                                             const charName = addResult.name || "用户";

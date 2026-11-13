@@ -245,7 +245,6 @@ function normalizePermission(value: unknown): CustomAppPermission | null {
     "chat.contacts.write",
     "chat.tools",
     "characters.read",
-    "characters.write",
     "characters.state.read",
     "characters.state.write",
     "characters.relations.read",
@@ -254,10 +253,6 @@ function normalizePermission(value: unknown): CustomAppPermission | null {
     "world.read",
     "world.write",
     "world.activate",
-    "regex.read",
-    "regex.write",
-    "story.read",
-    "story.write",
     "memory.readCore",
     "memory.readLongTerm",
     "memory.readShortTerm",
@@ -1058,7 +1053,17 @@ export function loadCustomAppTimelineEntries(
   options?: { afterTimestamp?: string },
 ): CustomAppTimelineEntry[] {
   const installed = loadInstalledCustomApps();
-  const entries = installed.flatMap(app => loadCustomAppTimelineForApp(app.id));
+  // Native modules also write to the shared custom-app timeline store. They are
+  // not necessarily present in the user's installed-custom-app registry.
+  const timelineAppIds = new Set([
+    ...installed.map(app => app.id),
+    "life",
+    "watch",
+    "photo_wall",
+    "phone_widget",
+    "global_watch",
+  ]);
+  const entries = [...timelineAppIds].flatMap(appId => loadCustomAppTimelineForApp(appId));
   return entries
     .filter(entry => !characterId || entry.characterId === characterId)
     .filter(entry => !options?.afterTimestamp || entry.createdAt > options.afterTimestamp)

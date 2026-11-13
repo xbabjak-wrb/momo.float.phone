@@ -6,6 +6,7 @@ import { loadCharacters } from "./character-storage";
 import { kvGet, kvSet, registerKvMigration } from "./kv-db";
 import { DEFAULT_MOMENTS_BILINGUAL_PROMPT } from "./bilingual-prompt-defaults";
 import { canCharacterSeeMomentPost, getVisibleMomentCommentsForCharacter } from "./character-world-storage";
+import { appendLifeTimelineEntry, loadVirtualLifeState, saveVirtualLifeState } from "./life/life-storage";
 import {
     initMomentsDb,
     dbPutPost,
@@ -113,6 +114,24 @@ export function addMomentPost(post: Omit<MomentPost, "id" | "likes" | "createdAt
     };
     _postsCache = [newPost, ...loadMomentPosts()]; // newest first
     dbPutPost(newPost);
+    try {
+        const life = loadVirtualLifeState();
+        if (life.settings.enabled) {
+            const isCharacter = newPost.authorType === "character";
+            const author = isCharacter ? loadCharacters().find(item => item.id === newPost.authorId)?.name ?? "角色" : "你";
+            const logged = appendLifeTimelineEntry(life, {
+                category: "social",
+                title: isCharacter ? author + "发了一条朋友圈" : "你发布了一条朋友圈",
+                details: (newPost.content || newPost.photoDescription || "发布了动态").slice(0, 160),
+                actorId: isCharacter ? newPost.authorId : "player",
+                actorName: author,
+                sourceId: newPost.id,
+            });
+            saveVirtualLifeState(logged);
+        }
+    } catch {
+        // Social feed must continue to work if Life timeline persistence is unavailable.
+    }
     return newPost;
 }
 
@@ -208,14 +227,13 @@ export function toggleMomentLike(
     postId: string,
     authorType: "user" | "character",
     authorId: string,
-    chatAccountId?: string,
 ): boolean {
     const posts = loadMomentPosts();
     const post = posts.find(p => p.id === postId);
     if (!post) return false;
 
     const existingIdx = post.likes.findIndex(
-        l => l.authorType === authorType && l.authorId === authorId && (authorType !== "user" || (l.chatAccountId || undefined) === (chatAccountId || undefined))
+        l => l.authorType === authorType && l.authorId === authorId
     );
 
     if (existingIdx >= 0) {
@@ -226,7 +244,6 @@ export function toggleMomentLike(
         post.likes.push({
             authorType,
             authorId,
-            ...(authorType === "user" && chatAccountId ? { chatAccountId } : {}),
             createdAt: new Date().toISOString(),
         });
         dbPutPost(post);

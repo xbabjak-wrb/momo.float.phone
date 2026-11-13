@@ -1,15 +1,8 @@
 import Dexie from "dexie";
 import { formatChatTimestamp } from "./llm-prompt-assembler";
 import { hydrateKvDb, kvGet, kvSet, registerKvMigration } from "./kv-db";
-import type { StoryAppearance, StoryAppearanceMode, StoryChromeAppearance, StoryReadingPanelMode } from "./story-appearance";
-import { stripStateAndInnerForPrompt } from "./prompt-sanitizer";
 
 export type StoryUiPrefs = {
-  appearanceMode?: StoryAppearanceMode;
-  /** 默认自动：有壁纸时移除阅读面板，无壁纸时保留。 */
-  readingPanel?: StoryReadingPanelMode;
-  appearance?: StoryAppearance;
-  chrome?: StoryChromeAppearance;
   hideBubble?: boolean;
   hideAvatar?: boolean;
   hideTimestamp?: boolean;
@@ -37,90 +30,6 @@ export type StoryUiPrefs = {
   /** @deprecated 旧版按角色保存的插入光标位置；已迁移进公用方案仓库。 */
   quickInputCursor?: "left" | "middle" | "right";
 };
-
-/** 剧情 APP 全局生成能力；不跟角色/多人组/分线走，所有剧情共用。 */
-export type StoryGlobalSettings = {
-  /** 剧情页打开期间，中止当前剧情角色正在进行的线上主动/追发 API 请求。 */
-  interruptProactiveDuringStory: boolean;
-  /** 生成过程中实时显示正文增量；默认关闭，避免不支持 SSE 的旧接口受影响。 */
-  streamingEnabled: boolean;
-  /** 每轮明确注入当前日期时间，并让历史消息按时间语义参与判断。 */
-  timeAware: boolean;
-};
-
-export const STORY_GLOBAL_SETTINGS_EVENT = "story-global-settings-updated";
-const STORY_GLOBAL_SETTINGS_KEY = "ai_phone_story_global_settings_v1";
-registerKvMigration(STORY_GLOBAL_SETTINGS_KEY);
-
-const DEFAULT_STORY_GLOBAL_SETTINGS: StoryGlobalSettings = {
-  interruptProactiveDuringStory: false,
-  streamingEnabled: false,
-  timeAware: true,
-};
-
-export function loadStoryGlobalSettings(): StoryGlobalSettings {
-  try {
-    const parsed = JSON.parse(kvGet(STORY_GLOBAL_SETTINGS_KEY) || "{}") as Partial<StoryGlobalSettings>;
-    return {
-      interruptProactiveDuringStory: parsed.interruptProactiveDuringStory === true,
-      streamingEnabled: parsed.streamingEnabled === true,
-      timeAware: parsed.timeAware !== false,
-    };
-  } catch {
-    return { ...DEFAULT_STORY_GLOBAL_SETTINGS };
-  }
-}
-
-export function saveStoryGlobalSettings(settings: StoryGlobalSettings): void {
-  const normalized: StoryGlobalSettings = {
-    interruptProactiveDuringStory: settings.interruptProactiveDuringStory === true,
-    streamingEnabled: settings.streamingEnabled === true,
-    timeAware: settings.timeAware !== false,
-  };
-  kvSet(STORY_GLOBAL_SETTINGS_KEY, JSON.stringify(normalized));
-  if (typeof window !== "undefined") {
-    window.dispatchEvent(new CustomEvent(STORY_GLOBAL_SETTINGS_EVENT, { detail: normalized }));
-  }
-}
-
-export type StorySettingsPreset = {
-  id: string;
-  name: string;
-  settings: StoryCharacterSettings;
-  uiPrefs: StoryUiPrefs;
-  globalSettings: StoryGlobalSettings;
-  customCSS: string;
-  foldTags: string;
-  contextExcludedTags: string;
-  createdAt: string;
-  updatedAt: string;
-};
-
-const STORY_SETTINGS_PRESETS_KEY = "ai_phone_story_settings_presets_v1";
-export const STORY_SETTINGS_PRESETS_EVENT = "story-settings-presets-updated";
-registerKvMigration(STORY_SETTINGS_PRESETS_KEY);
-
-export function loadStorySettingsPresets(): StorySettingsPreset[] {
-  try {
-    const parsed = JSON.parse(kvGet(STORY_SETTINGS_PRESETS_KEY) || "[]") as unknown;
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((item): item is StorySettingsPreset => Boolean(
-      item && typeof item === "object"
-      && typeof (item as StorySettingsPreset).id === "string"
-      && typeof (item as StorySettingsPreset).name === "string"
-      && (item as StorySettingsPreset).settings
-      && (item as StorySettingsPreset).uiPrefs
-      && (item as StorySettingsPreset).globalSettings,
-    ));
-  } catch {
-    return [];
-  }
-}
-
-export function saveStorySettingsPresets(presets: StorySettingsPreset[]): void {
-  kvSet(STORY_SETTINGS_PRESETS_KEY, JSON.stringify(presets));
-  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(STORY_SETTINGS_PRESETS_EVENT));
-}
 
 /** 快捷输入面板默认选项：成对引号 + 常用标点。 */
 export const STORY_DEFAULT_QUICK_INPUT_OPTIONS = ["“”", "「」", "，", "？", "……"];
@@ -396,22 +305,14 @@ export type StoryCharacterSettings = {
   minChars?: number;
   maxChars?: number;
   userPerspective?: "second" | "third" | "username";
-  /** 引导在剧情正文中适量生成角色心理描写；缺省关闭，沿用原预设。 */
-  innerThoughtGenerationEnabled?: boolean;
-  /** 引导在剧情正文中使用 Markdown 加粗突出重点；缺省关闭。 */
-  emphasisGenerationEnabled?: boolean;
   proseStyle?: string;
   proseStylePrompt?: string;
   /** 当前角色启用的文风方案（存于公用方案仓库），仅保存选择。 */
   activeProseStyleSchemeId?: string;
   /** 当前角色启用的状态栏方案（存于公用方案仓库），仅保存选择。 */
   activeStatusSchemeId?: string;
-  /** 是否把状态栏方案的生成要求加入剧情提示词；缺省为开启。 */
-  statusGenerationEnabled?: boolean;
   /** 当前角色启用的小剧场方案（存于公用方案仓库），仅保存选择。 */
   activeTheaterSchemeId?: string;
-  /** 是否把小剧场方案的生成要求加入剧情提示词；缺省为开启。 */
-  theaterGenerationEnabled?: boolean;
   /** @deprecated 旧版按角色保存的文风方案列表；已迁移进公用方案仓库。 */
   proseStyleSchemes?: StoryProseStyleScheme[];
   /** @deprecated 旧版按角色保存的状态栏方案列表；已迁移进公用方案仓库。 */
@@ -421,6 +322,63 @@ export type StoryCharacterSettings = {
   floatingPhoneEnabled?: boolean;
   floatingPhoneInContext?: boolean;
 };
+
+export type StoryMemorySettings = {
+  readCoreMemory: boolean;
+  readLongTermMemory: boolean;
+  readPublicShortTermMemory: boolean;
+  readOtherBranchMemory: boolean;
+  readOtherAppsMemory: boolean;
+  writePublicShortTermMemory: boolean;
+  writeLongTermMemory: boolean;
+  writeCoreMemory: boolean;
+  writeBranchMemory: boolean;
+  allowOtherBranchesRead: boolean;
+  /** 当前分线允许读取的其他分线 session id。 */
+  readableBranchIds: string[];
+  /** 允许共享给其他分线的记忆类型。 */
+  sharedMemoryTypes: Array<"branch" | "public_short_term" | "long_term" | "core">;
+};
+
+/** 新旧数据兼容：缺少配置时沿用旧版常规剧情行为。 */
+export const DEFAULT_STORY_MEMORY_SETTINGS: StoryMemorySettings = {
+  readCoreMemory: true,
+  readLongTermMemory: true,
+  readPublicShortTermMemory: true,
+  readOtherBranchMemory: false,
+  readOtherAppsMemory: true,
+  writePublicShortTermMemory: true,
+  writeLongTermMemory: true,
+  writeCoreMemory: true,
+  writeBranchMemory: true,
+  allowOtherBranchesRead: true,
+  readableBranchIds: [],
+  sharedMemoryTypes: ["branch", "public_short_term", "long_term", "core"],
+};
+
+export function resolveStoryMemorySettings(session?: Pick<StorySession, "memorySettings" | "independentStory"> | null): StoryMemorySettings {
+  const stored = session?.memorySettings;
+  const resolved: StoryMemorySettings = {
+    ...DEFAULT_STORY_MEMORY_SETTINGS,
+    ...stored,
+    readableBranchIds: Array.isArray(stored?.readableBranchIds) ? [...stored.readableBranchIds] : [],
+    sharedMemoryTypes: Array.isArray(stored?.sharedMemoryTypes) ? [...stored.sharedMemoryTypes] : [...DEFAULT_STORY_MEMORY_SETTINGS.sharedMemoryTypes],
+  };
+  // 旧版 independentStory 继续表现为不继承角色记忆，但不覆盖新配置。
+  if (!stored && session?.independentStory) {
+    resolved.readCoreMemory = false;
+    resolved.readLongTermMemory = false;
+    resolved.readPublicShortTermMemory = false;
+    resolved.readOtherAppsMemory = false;
+    resolved.writePublicShortTermMemory = false;
+    resolved.writeLongTermMemory = false;
+    resolved.writeCoreMemory = false;
+    resolved.writeBranchMemory = false;
+    resolved.allowOtherBranchesRead = false;
+    resolved.writePublicShortTermMemory = false;
+  }
+  return resolved;
+}
 
 export type StoryOwnerType = "single" | "group";
 
@@ -447,20 +405,14 @@ export type StorySession = {
   branchId?: string;
   branchName?: string;
   branchOrder?: number;
-  /** 由自定义 APP 管理的开场候选集；用于在剧情主线与开场存档之间安全切换。 */
-  openingSetId?: string;
-  /** 当前会话对应的开场候选项。 */
-  openingId?: string;
-  /** 开场切换时自动保存的隐藏存档，不直接展示在剧情分线目录。 */
-  openingArchive?: boolean;
-  /** 隐藏于剧情分线目录；转为正式分线后会被清除。 */
-  hiddenFromBranchList?: boolean;
   createdAt?: string;
   /** 新分线是否允许读取创建前的最近记忆；开启后由 UI 锁定，避免反复改变语义。 */
   inheritRecentMemory?: boolean;
   inheritRecentMemoryLocked?: boolean;
-  /** 独立剧情不读取角色短期、核心和长期记忆。 */
+  /** 旧版独立剧情兼容字段；新版本以每条分线的 memorySettings 为准。 */
   independentStory?: boolean;
+  /** 每条分线独立的记忆读写权限；各开关互不绑定。 */
+  memorySettings?: StoryMemorySettings;
   /** 小说目录页展示的自定义标签，保存在该故事的主线会话上。 */
   catalogTags?: string[];
   /** 从相册设置的剧情封面/头像（data URL）；通常保存在主线会话。 */
@@ -471,9 +423,6 @@ export type StorySession = {
   /** 独立剧情结束后可显式并入角色记忆。 */
   endedAt?: string;
   includedInMemoryAt?: string;
-  /** 分线内容已经按时间复制并合并到主线，避免重复合并与重复注入。 */
-  mergedIntoMainAt?: string;
-  mergedIntoMainSessionId?: string;
   updatedAt: string;
   customCSS?: string;
   foldTags?: string;            // Comma-separated tag names to fold for this session.
@@ -492,11 +441,11 @@ export type StoryMessage = {
   id: string;
   sessionId: string;
   role: StoryMessageRole;
-  /** 仅控制送入剧情模型时的身份；可让系统样式卡片以用户行为进入上下文。 */
-  contextRole?: StoryMessageRole;
   rawContent: string;
   renderedContent?: string;
   storySummary?: string;
+  /** 仅供其他分线读取的专属摘要；与公共短期事件摘要分开保存。 */
+  branchMemorySummary?: string;
   regexSignature?: string;
   parserVersion?: number;
   createdAt: string;
@@ -504,9 +453,9 @@ export type StoryMessage = {
 
 export type StoryProjectionEntry = {
   id: string;
+  sessionId?: string;
   timestamp: string;
   content: string;
-  sourceLabel?: string;
 };
 
 class StoryDatabase extends Dexie {
@@ -797,6 +746,7 @@ export type CreateStorySessionOptions = {
   branchOrder?: number;
   inheritRecentMemory?: boolean;
   independentStory?: boolean;
+  memorySettings?: StoryMemorySettings;
   baseSession?: StorySession;
 };
 
@@ -807,10 +757,7 @@ export function getStorySessionOwnerKey(session: Pick<StorySession, "characterId
 
 export function loadStorySessionsForOwner(ownerType: StoryOwnerType, ownerId: string): StorySession[] {
   return loadStorySessions()
-    .filter((session) => (
-      getStorySessionOwnerKey(session) === `${ownerType}:${ownerId}`
-      && session.hiddenFromBranchList !== true
-    ))
+    .filter((session) => getStorySessionOwnerKey(session) === `${ownerType}:${ownerId}`)
     .sort((a, b) => (a.branchOrder ?? 0) - (b.branchOrder ?? 0) || (a.createdAt || "").localeCompare(b.createdAt || ""));
 }
 
@@ -846,6 +793,7 @@ export function createOrGetStorySession(characterId: string, options: CreateStor
     inheritRecentMemory: branchId === "main" ? true : Boolean(options.inheritRecentMemory),
     inheritRecentMemoryLocked: branchId !== "main" && Boolean(options.inheritRecentMemory),
     independentStory: branchId === "main" ? false : Boolean(options.independentStory),
+    memorySettings: options.memorySettings ? { ...options.memorySettings, readableBranchIds: [...options.memorySettings.readableBranchIds], sharedMemoryTypes: [...options.memorySettings.sharedMemoryTypes] } : (base?.memorySettings ? { ...base.memorySettings, readableBranchIds: [...base.memorySettings.readableBranchIds], sharedMemoryTypes: [...base.memorySettings.sharedMemoryTypes] } : undefined),
     createdAt: now,
     updatedAt: now,
     foldTags: base?.foldTags ?? "think,thinking,story_status,story_theater",
@@ -873,45 +821,6 @@ export function deleteStorySessions(sessionIds: string[], options?: { allowMain?
     await storyDb.sessions.bulkDelete(deletable);
     if (messageIds.length) await storyDb.messages.bulkDelete(messageIds);
   }).catch(() => undefined);
-}
-
-export type MergeStoryBranchesResult = {
-  mergedSessionIds: string[];
-  skippedSessionIds: string[];
-  copiedMessageCount: number;
-};
-
-/**
- * 将用户选择的普通分线按原始时间并入主线。
- * 来源分线保留在目录中，但标记为已合并；其投影随后不再重复注入。
- */
-export function mergeStoryBranchesIntoMain(ownerType: StoryOwnerType, ownerId: string, sourceSessionIds: string[]): MergeStoryBranchesResult {
-  const sessions = loadStorySessionsForOwner(ownerType, ownerId);
-  const main = sessions.find((session) => (session.branchId || "main") === "main");
-  if (!main) return { mergedSessionIds: [], skippedSessionIds: sourceSessionIds, copiedMessageCount: 0 };
-  const requested = new Set(sourceSessionIds);
-  const sources = sessions.filter((session) => requested.has(session.id) && (session.branchId || "main") !== "main");
-  const eligible = sources.filter((session) => !session.independentStory && !session.mergedIntoMainAt);
-  const skippedSessionIds = sources.filter((session) => !eligible.includes(session)).map((session) => session.id);
-  const existing = loadStoryMessages(main.id);
-  const copied = eligible.flatMap((source) => loadStoryMessages(source.id).map((message) => ({
-    ...message,
-    id: generateId("story_merge"),
-    sessionId: main.id,
-  })));
-  if (copied.length) {
-    replaceStoryMessages(main.id, [...existing, ...copied].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)));
-  }
-  const mergedAt = new Date().toISOString();
-  for (const source of eligible) {
-    updateStorySession(source.id, { mergedIntoMainAt: mergedAt, mergedIntoMainSessionId: main.id });
-  }
-  if (eligible.length) updateStorySession(main.id, { updatedAt: mergedAt });
-  return {
-    mergedSessionIds: eligible.map((session) => session.id),
-    skippedSessionIds,
-    copiedMessageCount: copied.length,
-  };
 }
 
 function sanitizeStoryGroup(raw: unknown): StoryGroup | null {
@@ -1090,30 +999,18 @@ function compactProjectionText(text: string, maxLen = 160): string {
   return plain.length > maxLen ? `${plain.slice(0, maxLen)}...` : plain;
 }
 
-function stripStoryScanExcludedContent(text: string, excludedTags?: string): string {
-  const tags = [...new Set(["think", "thinking", "analysis", ...(excludedTags ?? "story_status,story_theater").split(",")].map(tag => tag.trim()).filter(Boolean))];
-  const names = tags.map(tag => tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-  return stripStateAndInnerForPrompt(text)
-    .replace(new RegExp(`<(${names})(?:\\s[^>]*)?>[\\s\\S]*?<\\/\\1\\s*>`, "gi"), "")
-    .replace(new RegExp(`<(${names})(?:\\s[^>]*)?>[\\s\\S]*$`, "gi"), "");
-}
-
 export function loadStoryProjectionEntries(
   characterId: string,
-  options?: { afterTimestamp?: string; userName?: string; charName?: string; includeUnmemorized?: boolean }
+  options?: { afterTimestamp?: string; userName?: string; charName?: string; memoryTarget?: "short_term" | "long_term" | "core" }
 ): StoryProjectionEntry[] {
   const sessions = _sessionsCache.filter((item) => {
     const participants = item.participantIds?.length ? item.participantIds : [item.characterId];
     if (!participants.includes(characterId)) return false;
-    if (item.mergedIntoMainAt && (item.branchId || "main") !== "main") return false;
-    if (options?.includeUnmemorized) return true;
-    if ((item.branchId || "main") === "main") return true;
-    if (item.independentStory) return Boolean(item.includedInMemoryAt);
-    return item.inheritRecentMemory === true || Boolean(item.includedInMemoryAt);
+    const memorySettings = resolveStoryMemorySettings(item);
+    const targetEnabled = options?.memoryTarget === "long_term" ? memorySettings.writeLongTermMemory : options?.memoryTarget === "core" ? memorySettings.writeCoreMemory : memorySettings.writePublicShortTermMemory;
+    return targetEnabled && (!item.independentStory || Boolean(item.includedInMemoryAt) || Boolean(item.memorySettings));
   });
   if (!sessions.length) return [];
-  const sessionLabels = new Map(sessions.map(session => [session.id, session.title || session.branchName || ((session.branchId || "main") === "main" ? "主线" : "分线")]));
-  const sessionById = new Map(sessions.map(session => [session.id, session]));
   const messages = sessions.flatMap((session) => loadStoryMessages(session.id))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const projections: StoryProjectionEntry[] = [];
@@ -1123,17 +1020,16 @@ export function loadStoryProjectionEntries(
     if (current.role !== "assistant") continue;
     if (options?.afterTimestamp && current.createdAt <= options.afterTimestamp) continue;
 
-    if (!current.storySummary && !options?.includeUnmemorized) continue;
-    const sourceText = current.storySummary || current.rawContent;
-    const summaryText = compactProjectionText(options?.includeUnmemorized ? stripStoryScanExcludedContent(sourceText, sessionById.get(current.sessionId)?.contextExcludedTags) : sourceText, options?.includeUnmemorized ? 100000 : 500);
+    if (!current.storySummary) continue;
+    const summaryText = compactProjectionText(current.storySummary, 500);
     if (!summaryText) continue;
 
     const ts = formatChatTimestamp(current.createdAt);
     projections.push({
       id: `story_projection_${current.id}`,
+      sessionId: current.sessionId,
       timestamp: current.createdAt,
-      content: `[事件 ${ts}] ${options?.includeUnmemorized ? `【${sessionLabels.get(current.sessionId) || "剧情"}】` : ""}${summaryText}`,
-      ...(options?.includeUnmemorized ? { sourceLabel: sessionLabels.get(current.sessionId) } : {}),
+      content: `[事件 ${ts}] ${summaryText}`,
     });
   }
 
