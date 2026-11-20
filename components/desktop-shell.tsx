@@ -33,6 +33,7 @@ import MapApp from "@/components/map/map-app";
 import { DwellingApp } from "@/components/dwelling/dwelling-app";
 import { MascotFloat } from "@/components/mascot/mascot-float";
 import { MascotPreviewHost } from "@/components/mascot/mascot-preview-host";
+import { PerceptionBootstrap } from "@/components/perception/perception-bootstrap";
 import { useMusicControlsOptional } from "@/lib/music-context";
 import { PhoneResourcesApp, type ResourceSubPage } from "@/components/phone-resources-app";
 import { CheckPhoneApp } from "@/components/checkphone/checkphone-app";
@@ -4059,7 +4060,19 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
       return <PhoneCalendarApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
     }
     if (activeApp === "realitybridge") {
-      return <RealityBridgeApp onClose={() => setActiveApp(null)} onNotice={setNotice} />;
+      return (
+        <RealityBridgeApp
+          onClose={() => setActiveApp(null)}
+          onNotice={setNotice}
+          onOpenSettings={(page) => {
+            try { sessionStorage.setItem("mascot-settings-mode", page); } catch { /* ignore */ }
+            setActiveApp("settings");
+            window.setTimeout(() => {
+              window.dispatchEvent(new CustomEvent("settings-navigate", { detail: { page } }));
+            }, 180);
+          }}
+        />
+      );
     }
     if (activeApp === "qa") {
       return (
@@ -4840,6 +4853,8 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
               <MascotFloat />
               {/* 预览弹窗宿主：独立于桌宠的展开/收起状态，否则桌宠收成小球时弹不出来 */}
               <MascotPreviewHost />
+              {/* Android perception sampling engine: no-op outside FloatShell. */}
+              <PerceptionBootstrap />
 
               {/* Widget Picker Bottom Sheet */}
               {showWidgetPicker && (
